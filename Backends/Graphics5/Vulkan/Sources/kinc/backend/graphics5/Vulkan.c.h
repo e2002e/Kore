@@ -38,6 +38,8 @@ void set_image_layout(VkImage image, VkImageAspectFlags aspectMask, VkImageLayou
 
 kinc_g5_texture_t *vulkanTextures[16] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
 kinc_g5_render_target_t *vulkanRenderTargets[16] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+// Per slot: sample the render target's depth instead of its color
+bool vulkanRenderTargetsDepth[16] = {false};
 VkSampler vulkanSamplers[16] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
                                 VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
 
@@ -985,6 +987,23 @@ void kinc_g5_internal_init() {
 
 			deviceinfo.enabledExtensionCount = wanted_device_extension_count;
 			deviceinfo.ppEnabledExtensionNames = (const char *const *)wanted_device_extensions;
+
+			// Features G4-style renderers rely on (per-target write masks in MRT, image load/store in
+			// compute/fragment shaders, cube arrays, anisotropic filtering); enabled when supported
+			VkPhysicalDeviceFeatures supported_features;
+			vkGetPhysicalDeviceFeatures(vk_ctx.gpu, &supported_features);
+			VkPhysicalDeviceFeatures enabled_features = {0};
+			enabled_features.independentBlend = supported_features.independentBlend;
+			enabled_features.fragmentStoresAndAtomics = supported_features.fragmentStoresAndAtomics;
+			enabled_features.vertexPipelineStoresAndAtomics = supported_features.vertexPipelineStoresAndAtomics;
+			enabled_features.shaderStorageImageWriteWithoutFormat = supported_features.shaderStorageImageWriteWithoutFormat;
+			enabled_features.shaderStorageImageReadWithoutFormat = supported_features.shaderStorageImageReadWithoutFormat;
+			enabled_features.shaderStorageImageExtendedFormats = supported_features.shaderStorageImageExtendedFormats;
+			enabled_features.imageCubeArray = supported_features.imageCubeArray;
+			enabled_features.samplerAnisotropy = supported_features.samplerAnisotropy;
+			enabled_features.depthClamp = supported_features.depthClamp;
+			enabled_features.shaderImageGatherExtended = supported_features.shaderImageGatherExtended;
+			deviceinfo.pEnabledFeatures = &enabled_features;
 
 #ifdef KINC_VKRT
 			VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineExt = {0};

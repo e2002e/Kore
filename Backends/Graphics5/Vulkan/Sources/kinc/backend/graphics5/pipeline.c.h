@@ -9,11 +9,14 @@
 VkDescriptorSetLayout desc_layout;
 extern kinc_g5_texture_t *vulkanTextures[16];
 extern kinc_g5_render_target_t *vulkanRenderTargets[16];
+extern bool vulkanRenderTargetsDepth[16];
 extern uint32_t swapchainImageCount;
 extern uint32_t current_buffer;
 bool memory_type_from_properties(uint32_t typeBits, VkFlags requirements_mask, uint32_t *typeIndex);
 
 static VkDescriptorPool descriptor_pool;
+// Graphics descriptor sets are cached and recycled each frame; this bounds the cache and the pool
+#define GRAPHICS_DESCRIPTOR_SET_COUNT 4096
 
 static bool has_number(kinc_internal_named_number *named_numbers, const char *name) {
 	for (int i = 0; i < KINC_INTERNAL_NAMED_NUMBER_COUNT; ++i) {
@@ -265,9 +268,17 @@ void kinc_g5_pipeline_init(kinc_g5_pipeline_t *pipeline) {
 }
 
 void kinc_g5_pipeline_destroy(kinc_g5_pipeline_t *pipeline) {
-	vkDestroyPipeline(vk_ctx.device, pipeline->impl.framebuffer_pipeline, NULL);
-	vkDestroyPipeline(vk_ctx.device, pipeline->impl.rendertarget_pipeline, NULL);
-	vkDestroyPipelineLayout(vk_ctx.device, pipeline->impl.pipeline_layout, NULL);
+	// Recorded or in-flight commands may still reference the pipelines: release deferred
+	for (int i = 0; i < pipeline->impl.variant_count; ++i) {
+		queue_pipeline_release(pipeline->impl.variants[i].pipeline, VK_NULL_HANDLE);
+	}
+	pipeline->impl.variant_count = 0;
+	queue_pipeline_release(VK_NULL_HANDLE, pipeline->impl.pipeline_layout);
+	pipeline->impl.pipeline_layout = VK_NULL_HANDLE;
+	vkDestroyShaderModule(vk_ctx.device, pipeline->impl.vert_shader_module, NULL);
+	vkDestroyShaderModule(vk_ctx.device, pipeline->impl.frag_shader_module, NULL);
+	pipeline->impl.vert_shader_module = VK_NULL_HANDLE;
+	pipeline->impl.frag_shader_module = VK_NULL_HANDLE;
 }
 
 kinc_g5_constant_location_t kinc_g5_pipeline_get_constant_location(kinc_g5_pipeline_t *pipeline, const char *name) {
@@ -384,6 +395,86 @@ static VkBlendOp convert_blend_operation(kinc_g5_blending_operation_t op) {
 	}
 }
 
+static VkFormat convert_vertex_format(kinc_g4_vertex_data_t data) {
+	switch (data) {
+	case KINC_G4_VERTEX_DATA_F32_1X:
+		return VK_FORMAT_R32_SFLOAT;
+	case KINC_G4_VERTEX_DATA_F32_2X:
+		return VK_FORMAT_R32G32_SFLOAT;
+	case KINC_G4_VERTEX_DATA_F32_3X:
+		return VK_FORMAT_R32G32B32_SFLOAT;
+	case KINC_G4_VERTEX_DATA_F32_4X:
+		return VK_FORMAT_R32G32B32A32_SFLOAT;
+	case KINC_G4_VERTEX_DATA_I8_1X:
+		return VK_FORMAT_R8_SINT;
+	case KINC_G4_VERTEX_DATA_U8_1X:
+		return VK_FORMAT_R8_UINT;
+	case KINC_G4_VERTEX_DATA_I8_1X_NORMALIZED:
+		return VK_FORMAT_R8_SNORM;
+	case KINC_G4_VERTEX_DATA_U8_1X_NORMALIZED:
+		return VK_FORMAT_R8_UNORM;
+	case KINC_G4_VERTEX_DATA_I8_2X:
+		return VK_FORMAT_R8G8_SINT;
+	case KINC_G4_VERTEX_DATA_U8_2X:
+		return VK_FORMAT_R8G8_UINT;
+	case KINC_G4_VERTEX_DATA_I8_2X_NORMALIZED:
+		return VK_FORMAT_R8G8_SNORM;
+	case KINC_G4_VERTEX_DATA_U8_2X_NORMALIZED:
+		return VK_FORMAT_R8G8_UNORM;
+	case KINC_G4_VERTEX_DATA_I8_4X:
+		return VK_FORMAT_R8G8B8A8_SINT;
+	case KINC_G4_VERTEX_DATA_U8_4X:
+		return VK_FORMAT_R8G8B8A8_UINT;
+	case KINC_G4_VERTEX_DATA_I8_4X_NORMALIZED:
+		return VK_FORMAT_R8G8B8A8_SNORM;
+	case KINC_G4_VERTEX_DATA_U8_4X_NORMALIZED:
+		return VK_FORMAT_R8G8B8A8_UNORM;
+	case KINC_G4_VERTEX_DATA_I16_1X:
+		return VK_FORMAT_R16_SINT;
+	case KINC_G4_VERTEX_DATA_U16_1X:
+		return VK_FORMAT_R16_UINT;
+	case KINC_G4_VERTEX_DATA_I16_1X_NORMALIZED:
+		return VK_FORMAT_R16_SNORM;
+	case KINC_G4_VERTEX_DATA_U16_1X_NORMALIZED:
+		return VK_FORMAT_R16_UNORM;
+	case KINC_G4_VERTEX_DATA_I16_2X:
+		return VK_FORMAT_R16G16_SINT;
+	case KINC_G4_VERTEX_DATA_U16_2X:
+		return VK_FORMAT_R16G16_UINT;
+	case KINC_G4_VERTEX_DATA_I16_2X_NORMALIZED:
+		return VK_FORMAT_R16G16_SNORM;
+	case KINC_G4_VERTEX_DATA_U16_2X_NORMALIZED:
+		return VK_FORMAT_R16G16_UNORM;
+	case KINC_G4_VERTEX_DATA_I16_4X:
+		return VK_FORMAT_R16G16B16A16_SINT;
+	case KINC_G4_VERTEX_DATA_U16_4X:
+		return VK_FORMAT_R16G16B16A16_UINT;
+	case KINC_G4_VERTEX_DATA_I16_4X_NORMALIZED:
+		return VK_FORMAT_R16G16B16A16_SNORM;
+	case KINC_G4_VERTEX_DATA_U16_4X_NORMALIZED:
+		return VK_FORMAT_R16G16B16A16_UNORM;
+	case KINC_G4_VERTEX_DATA_I32_1X:
+		return VK_FORMAT_R32_SINT;
+	case KINC_G4_VERTEX_DATA_U32_1X:
+		return VK_FORMAT_R32_UINT;
+	case KINC_G4_VERTEX_DATA_I32_2X:
+		return VK_FORMAT_R32G32_SINT;
+	case KINC_G4_VERTEX_DATA_U32_2X:
+		return VK_FORMAT_R32G32_UINT;
+	case KINC_G4_VERTEX_DATA_I32_3X:
+		return VK_FORMAT_R32G32B32_SINT;
+	case KINC_G4_VERTEX_DATA_U32_3X:
+		return VK_FORMAT_R32G32B32_UINT;
+	case KINC_G4_VERTEX_DATA_I32_4X:
+		return VK_FORMAT_R32G32B32A32_SINT;
+	case KINC_G4_VERTEX_DATA_U32_4X:
+		return VK_FORMAT_R32G32B32A32_UINT;
+	default:
+		assert(false);
+		return VK_FORMAT_R32G32B32A32_SFLOAT;
+	}
+}
+
 void kinc_g5_pipeline_compile(kinc_g5_pipeline_t *pipeline) {
 	memset(pipeline->impl.vertexLocations, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
 	memset(pipeline->impl.vertexOffsets, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
@@ -404,6 +495,38 @@ void kinc_g5_pipeline_compile(kinc_g5_pipeline_t *pipeline) {
 	VkResult err = vkCreatePipelineLayout(vk_ctx.device, &pPipelineLayoutCreateInfo, NULL, &pipeline->impl.pipeline_layout);
 	assert(!err);
 
+	// Snapshot the vertex input state now: the input layout structures may be temporaries
+	pipeline->impl.vi_binding_count = 0;
+	pipeline->impl.vi_attr_count = 0;
+	for (int binding = 0; binding < 16; ++binding) {
+		if (pipeline->inputLayout[binding] == NULL) {
+			break;
+		}
+		uint32_t offset = 0;
+		for (int i = 0; i < pipeline->inputLayout[binding]->size; ++i) {
+			kinc_g5_vertex_element_t element = pipeline->inputLayout[binding]->elements[i];
+			// Attributes the vertex shader doesn't consume (location -1) must not be declared
+			if (has_number(pipeline->impl.vertexLocations, element.name) && pipeline->impl.vi_attr_count < 64) {
+				VkVertexInputAttributeDescription *attr = &pipeline->impl.vi_attrs[pipeline->impl.vi_attr_count++];
+				attr->binding = binding;
+				attr->location = find_number(pipeline->impl.vertexLocations, element.name);
+				attr->offset = offset;
+				attr->format = convert_vertex_format(element.data);
+			}
+			offset += kinc_g4_vertex_data_size(element.data);
+		}
+		VkVertexInputBindingDescription *vi_binding = &pipeline->impl.vi_bindings[pipeline->impl.vi_binding_count++];
+		vi_binding->binding = binding;
+		vi_binding->stride = offset;
+		vi_binding->inputRate = pipeline->inputLayout[binding]->instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
+	}
+
+	prepare_vs(&pipeline->impl.vert_shader_module, pipeline->vertexShader);
+	prepare_fs(&pipeline->impl.frag_shader_module, pipeline->fragmentShader);
+	pipeline->impl.variant_count = 0;
+}
+
+static VkPipeline create_pipeline_variant(kinc_g5_pipeline_t *pipeline, VkRenderPass pass, int color_count) {
 	VkGraphicsPipelineCreateInfo pipeline_info = {0};
 
 	VkPipelineInputAssemblyStateCreateInfo ia = {0};
@@ -425,167 +548,12 @@ void kinc_g5_pipeline_compile(kinc_g5_pipeline_t *pipeline) {
 	pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
 	pipeline_info.layout = pipeline->impl.pipeline_layout;
 
-	int vertexAttributeCount = 0;
-	int vertexBindingCount = 0;
-	for (int i = 0; i < 16; ++i) {
-		if (pipeline->inputLayout[i] == NULL) {
-			break;
-		}
-		vertexAttributeCount += pipeline->inputLayout[i]->size;
-		vertexBindingCount++;
-	}
-
-#ifdef KINC_WINDOWS
-	VkVertexInputBindingDescription *vi_bindings = (VkVertexInputBindingDescription *)alloca(sizeof(VkVertexInputBindingDescription) * vertexBindingCount);
-#else
-	VkVertexInputBindingDescription vi_bindings[vertexBindingCount];
-#endif
-#ifdef KINC_WINDOWS
-	VkVertexInputAttributeDescription *vi_attrs = (VkVertexInputAttributeDescription *)alloca(sizeof(VkVertexInputAttributeDescription) * vertexAttributeCount);
-#else
-	VkVertexInputAttributeDescription vi_attrs[vertexAttributeCount];
-#endif
 	VkPipelineVertexInputStateCreateInfo vi = {0};
-	memset(&vi, 0, sizeof(vi));
 	vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-	vi.pNext = NULL;
-	vi.vertexBindingDescriptionCount = vertexBindingCount;
-	vi.pVertexBindingDescriptions = vi_bindings;
-	vi.vertexAttributeDescriptionCount = vertexAttributeCount;
-	vi.pVertexAttributeDescriptions = vi_attrs;
-
-	uint32_t attr = 0;
-	for (int binding = 0; binding < vertexBindingCount; ++binding) {
-		uint32_t offset = 0;
-		uint32_t stride = 0;
-		for (int i = 0; i < pipeline->inputLayout[binding]->size; ++i) {
-			kinc_g5_vertex_element_t element = pipeline->inputLayout[binding]->elements[i];
-
-			vi_attrs[attr].binding = binding;
-			vi_attrs[attr].location = find_number(pipeline->impl.vertexLocations, element.name);
-			vi_attrs[attr].offset = offset;
-			offset += kinc_g4_vertex_data_size(element.data);
-			stride += kinc_g4_vertex_data_size(element.data);
-
-			switch (element.data) {
-			case KINC_G4_VERTEX_DATA_F32_1X:
-				vi_attrs[attr].format = VK_FORMAT_R32_SFLOAT;
-				break;
-			case KINC_G4_VERTEX_DATA_F32_2X:
-				vi_attrs[attr].format = VK_FORMAT_R32G32_SFLOAT;
-				break;
-			case KINC_G4_VERTEX_DATA_F32_3X:
-				vi_attrs[attr].format = VK_FORMAT_R32G32B32_SFLOAT;
-				break;
-			case KINC_G4_VERTEX_DATA_F32_4X:
-				vi_attrs[attr].format = VK_FORMAT_R32G32B32A32_SFLOAT;
-				break;
-			case KINC_G4_VERTEX_DATA_I8_1X:
-				vi_attrs[attr].format = VK_FORMAT_R8_SINT;
-				break;
-			case KINC_G4_VERTEX_DATA_U8_1X:
-				vi_attrs[attr].format = VK_FORMAT_R8_UINT;
-				break;
-			case KINC_G4_VERTEX_DATA_I8_1X_NORMALIZED:
-				vi_attrs[attr].format = VK_FORMAT_R8_SNORM;
-				break;
-			case KINC_G4_VERTEX_DATA_U8_1X_NORMALIZED:
-				vi_attrs[attr].format = VK_FORMAT_R8_UNORM;
-				break;
-			case KINC_G4_VERTEX_DATA_I8_2X:
-				vi_attrs[attr].format = VK_FORMAT_R8G8_SINT;
-				break;
-			case KINC_G4_VERTEX_DATA_U8_2X:
-				vi_attrs[attr].format = VK_FORMAT_R8G8_UINT;
-				break;
-			case KINC_G4_VERTEX_DATA_I8_2X_NORMALIZED:
-				vi_attrs[attr].format = VK_FORMAT_R8G8_SNORM;
-				break;
-			case KINC_G4_VERTEX_DATA_U8_2X_NORMALIZED:
-				vi_attrs[attr].format = VK_FORMAT_R8G8_UNORM;
-				break;
-			case KINC_G4_VERTEX_DATA_I8_4X:
-				vi_attrs[attr].format = VK_FORMAT_R8G8B8A8_SINT;
-				break;
-			case KINC_G4_VERTEX_DATA_U8_4X:
-				vi_attrs[attr].format = VK_FORMAT_R8G8B8A8_UINT;
-				break;
-			case KINC_G4_VERTEX_DATA_I8_4X_NORMALIZED:
-				vi_attrs[attr].format = VK_FORMAT_R8G8B8A8_SNORM;
-				break;
-			case KINC_G4_VERTEX_DATA_U8_4X_NORMALIZED:
-				vi_attrs[attr].format = VK_FORMAT_R8G8B8A8_UNORM;
-				break;
-			case KINC_G4_VERTEX_DATA_I16_1X:
-				vi_attrs[attr].format = VK_FORMAT_R16_SINT;
-				break;
-			case KINC_G4_VERTEX_DATA_U16_1X:
-				vi_attrs[attr].format = VK_FORMAT_R16_UINT;
-				break;
-			case KINC_G4_VERTEX_DATA_I16_1X_NORMALIZED:
-				vi_attrs[attr].format = VK_FORMAT_R16_SNORM;
-				break;
-			case KINC_G4_VERTEX_DATA_U16_1X_NORMALIZED:
-				vi_attrs[attr].format = VK_FORMAT_R16_UNORM;
-				break;
-			case KINC_G4_VERTEX_DATA_I16_2X:
-				vi_attrs[attr].format = VK_FORMAT_R16G16_SINT;
-				break;
-			case KINC_G4_VERTEX_DATA_U16_2X:
-				vi_attrs[attr].format = VK_FORMAT_R16G16_UINT;
-				break;
-			case KINC_G4_VERTEX_DATA_I16_2X_NORMALIZED:
-				vi_attrs[attr].format = VK_FORMAT_R16G16_SNORM;
-				break;
-			case KINC_G4_VERTEX_DATA_U16_2X_NORMALIZED:
-				vi_attrs[attr].format = VK_FORMAT_R16G16_UNORM;
-				break;
-			case KINC_G4_VERTEX_DATA_I16_4X:
-				vi_attrs[attr].format = VK_FORMAT_R16G16B16A16_SINT;
-				break;
-			case KINC_G4_VERTEX_DATA_U16_4X:
-				vi_attrs[attr].format = VK_FORMAT_R16G16B16A16_UINT;
-				break;
-			case KINC_G4_VERTEX_DATA_I16_4X_NORMALIZED:
-				vi_attrs[attr].format = VK_FORMAT_R16G16B16A16_SNORM;
-				break;
-			case KINC_G4_VERTEX_DATA_U16_4X_NORMALIZED:
-				vi_attrs[attr].format = VK_FORMAT_R16G16B16A16_UNORM;
-				break;
-			case KINC_G4_VERTEX_DATA_I32_1X:
-				vi_attrs[attr].format = VK_FORMAT_R32_SINT;
-				break;
-			case KINC_G4_VERTEX_DATA_U32_1X:
-				vi_attrs[attr].format = VK_FORMAT_R32_UINT;
-				break;
-			case KINC_G4_VERTEX_DATA_I32_2X:
-				vi_attrs[attr].format = VK_FORMAT_R32G32_SINT;
-				break;
-			case KINC_G4_VERTEX_DATA_U32_2X:
-				vi_attrs[attr].format = VK_FORMAT_R32G32_UINT;
-				break;
-			case KINC_G4_VERTEX_DATA_I32_3X:
-				vi_attrs[attr].format = VK_FORMAT_R32G32B32_SINT;
-				break;
-			case KINC_G4_VERTEX_DATA_U32_3X:
-				vi_attrs[attr].format = VK_FORMAT_R32G32B32_UINT;
-				break;
-			case KINC_G4_VERTEX_DATA_I32_4X:
-				vi_attrs[attr].format = VK_FORMAT_R32G32B32A32_SINT;
-				break;
-			case KINC_G4_VERTEX_DATA_U32_4X:
-				vi_attrs[attr].format = VK_FORMAT_R32G32B32A32_UINT;
-				break;
-			default:
-				assert(false);
-				break;
-			}
-			attr++;
-		}
-		vi_bindings[binding].binding = binding;
-		vi_bindings[binding].stride = stride;
-		vi_bindings[binding].inputRate = pipeline->inputLayout[binding]->instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
-	}
+	vi.vertexBindingDescriptionCount = pipeline->impl.vi_binding_count;
+	vi.pVertexBindingDescriptions = pipeline->impl.vi_bindings;
+	vi.vertexAttributeDescriptionCount = pipeline->impl.vi_attr_count;
+	vi.pVertexAttributeDescriptions = pipeline->impl.vi_attrs;
 
 	memset(&ia, 0, sizeof(ia));
 	ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -605,7 +573,8 @@ void kinc_g5_pipeline_compile(kinc_g5_pipeline_t *pipeline) {
 	cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
 	VkPipelineColorBlendAttachmentState att_state[8];
 	memset(att_state, 0, sizeof(att_state));
-	for (int i = 0; i < pipeline->colorAttachmentCount; ++i) {
+	// Blend state count must match the render pass's color attachments, not what the pipeline declared
+	for (int i = 0; i < color_count; ++i) {
 		att_state[i].colorWriteMask =
 		    (pipeline->colorWriteMaskRed[i] ? VK_COLOR_COMPONENT_R_BIT : 0) | (pipeline->colorWriteMaskGreen[i] ? VK_COLOR_COMPONENT_G_BIT : 0) |
 		    (pipeline->colorWriteMaskBlue[i] ? VK_COLOR_COMPONENT_B_BIT : 0) | (pipeline->colorWriteMaskAlpha[i] ? VK_COLOR_COMPONENT_A_BIT : 0);
@@ -618,7 +587,7 @@ void kinc_g5_pipeline_compile(kinc_g5_pipeline_t *pipeline) {
 		att_state[i].dstAlphaBlendFactor = convert_blend_factor(pipeline->alpha_blend_destination);
 		att_state[i].alphaBlendOp = convert_blend_operation(pipeline->alpha_blend_operation);
 	}
-	cb.attachmentCount = pipeline->colorAttachmentCount;
+	cb.attachmentCount = color_count;
 	cb.pAttachments = att_state;
 
 	memset(&vp, 0, sizeof(vp));
@@ -651,12 +620,12 @@ void kinc_g5_pipeline_compile(kinc_g5_pipeline_t *pipeline) {
 
 	shaderStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	shaderStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-	shaderStages[0].module = prepare_vs(&pipeline->impl.vert_shader_module, pipeline->vertexShader);
+	shaderStages[0].module = pipeline->impl.vert_shader_module;
 	shaderStages[0].pName = "main";
 
 	shaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-	shaderStages[1].module = prepare_fs(&pipeline->impl.frag_shader_module, pipeline->fragmentShader);
+	shaderStages[1].module = pipeline->impl.frag_shader_module;
 	shaderStages[1].pName = "main";
 
 	pipeline_info.pVertexInputState = &vi;
@@ -667,24 +636,38 @@ void kinc_g5_pipeline_compile(kinc_g5_pipeline_t *pipeline) {
 	pipeline_info.pViewportState = &vp;
 	pipeline_info.pDepthStencilState = &ds;
 	pipeline_info.pStages = shaderStages;
-	pipeline_info.renderPass = vk_ctx.windows[vk_ctx.current_window].framebuffer_render_pass;
+	pipeline_info.renderPass = pass;
 	pipeline_info.pDynamicState = &dynamicState;
 
-	err = vkCreateGraphicsPipelines(vk_ctx.device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &pipeline->impl.framebuffer_pipeline);
-	assert(!err);
-
-	if (pipeline->depthAttachmentBits > 0) {
-		pipeline_info.renderPass = vk_ctx.windows[vk_ctx.current_window].rendertarget_render_pass_with_depth;
+	// The back buffer is rendered y-flipped (negative viewport height), offscreen targets are not,
+	// which mirrors the winding: keep GL's counter-clockwise front faces in both cases
+	bool flipped = pass == vk_ctx.windows[vk_ctx.current_window].framebuffer_render_pass;
+	rs.frontFace = flipped ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+	VkPipeline result = VK_NULL_HANDLE;
+	VkResult err = vkCreateGraphicsPipelines(vk_ctx.device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &result);
+	if (err != VK_SUCCESS) {
+		kinc_log(KINC_LOG_LEVEL_ERROR, "Could not create Vulkan pipeline (%d).", (int)err);
 	}
-	else {
-		pipeline_info.renderPass = vk_ctx.windows[vk_ctx.current_window].rendertarget_render_pass;
+	return result;
+}
+
+VkPipeline kinc_vulkan_internal_get_pipeline(kinc_g5_pipeline_t *pipeline, VkRenderPass pass, int color_count) {
+	for (int i = 0; i < pipeline->impl.variant_count; ++i) {
+		if (pipeline->impl.variants[i].pass == pass) {
+			return pipeline->impl.variants[i].pipeline;
+		}
 	}
-
-	err = vkCreateGraphicsPipelines(vk_ctx.device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &pipeline->impl.rendertarget_pipeline);
-	assert(!err);
-
-	vkDestroyShaderModule(vk_ctx.device, pipeline->impl.frag_shader_module, NULL);
-	vkDestroyShaderModule(vk_ctx.device, pipeline->impl.vert_shader_module, NULL);
+	if (pipeline->impl.variant_count == 16) {
+		// Evict the oldest; it may still be referenced by recorded commands, so release it deferred
+		queue_pipeline_release(pipeline->impl.variants[0].pipeline, VK_NULL_HANDLE);
+		memmove(&pipeline->impl.variants[0], &pipeline->impl.variants[1], sizeof(pipeline->impl.variants[0]) * 15);
+		pipeline->impl.variant_count = 15;
+	}
+	VkPipeline created = create_pipeline_variant(pipeline, pass, color_count);
+	pipeline->impl.variants[pipeline->impl.variant_count].pass = pass;
+	pipeline->impl.variants[pipeline->impl.variant_count].pipeline = created;
+	pipeline->impl.variant_count++;
+	return created;
 }
 
 void createDescriptorLayout(void) {
@@ -724,15 +707,15 @@ void createDescriptorLayout(void) {
 	memset(typeCounts, 0, sizeof(typeCounts));
 
 	typeCounts[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
-	typeCounts[0].descriptorCount = 2 * 1024;
+	typeCounts[0].descriptorCount = 2 * GRAPHICS_DESCRIPTOR_SET_COUNT;
 
 	typeCounts[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	typeCounts[1].descriptorCount = 16 * 1024;
+	typeCounts[1].descriptorCount = 16 * GRAPHICS_DESCRIPTOR_SET_COUNT;
 
 	VkDescriptorPoolCreateInfo pool_info = {0};
 	pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	pool_info.pNext = NULL;
-	pool_info.maxSets = 1024;
+	pool_info.maxSets = GRAPHICS_DESCRIPTOR_SET_COUNT;
 	pool_info.poolSizeCount = 2;
 	pool_info.pPoolSizes = typeCounts;
 
@@ -781,11 +764,12 @@ struct destriptor_set {
 	VkDescriptorSet set;
 };
 
-static struct destriptor_set descriptor_sets[MAX_DESCRIPTOR_SETS] = {0};
+static struct destriptor_set descriptor_sets[GRAPHICS_DESCRIPTOR_SET_COUNT] = {0};
 static int descriptor_sets_count = 0;
 
 static int write_tex_descs(VkDescriptorImageInfo *tex_descs) {
 	memset(tex_descs, 0, sizeof(VkDescriptorImageInfo) * 16);
+	ensure_dummy_texture();
 
 	int texture_count = 0;
 	for (int i = 0; i < 16; ++i) {
@@ -796,14 +780,20 @@ static int write_tex_descs(VkDescriptorImageInfo *tex_descs) {
 		}
 		else if (vulkanRenderTargets[i] != NULL) {
 			tex_descs[i].sampler = vulkanSamplers[i];
-			if (vulkanRenderTargets[i]->impl.stage_depth == i) {
+			if (vulkanRenderTargetsDepth[i]) {
 				tex_descs[i].imageView = vulkanRenderTargets[i]->impl.depthView;
-				vulkanRenderTargets[i]->impl.stage_depth = -1;
 			}
 			else {
 				tex_descs[i].imageView = vulkanRenderTargets[i]->impl.sourceView;
 			}
 			texture_count++;
+		}
+		// Every slot gets written: unbound or incomplete ones sample a 1x1 (0,0,0,1) texture, like GL
+		if (tex_descs[i].imageView == VK_NULL_HANDLE) {
+			tex_descs[i].imageView = dummy_texture_view;
+		}
+		if (tex_descs[i].sampler == VK_NULL_HANDLE) {
+			tex_descs[i].sampler = dummy_sampler;
 		}
 		tex_descs[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 	}
@@ -835,9 +825,8 @@ static void update_textures(struct destriptor_set *set) {
 		writes[i].pImageInfo = &set->tex_desc[i];
 	}
 
-	if (vulkanTextures[0] != NULL || vulkanRenderTargets[0] != NULL) {
-		vkUpdateDescriptorSets(vk_ctx.device, texture_count, writes, 0, NULL);
-	}
+	(void)texture_count;
+	vkUpdateDescriptorSets(vk_ctx.device, 16, writes, 0, NULL);
 }
 
 void reuse_descriptor_sets(void) {
@@ -890,29 +879,7 @@ VkDescriptorSet getDescriptorSet() {
 	buffer_descs[1].range = 256 * sizeof(float);
 
 	VkDescriptorImageInfo tex_desc[16];
-	memset(&tex_desc, 0, sizeof(tex_desc));
-
-	int texture_count = 0;
-	for (int i = 0; i < 16; ++i) {
-		if (vulkanTextures[i] != NULL) {
-			assert(vulkanSamplers[i] != VK_NULL_HANDLE);
-			tex_desc[i].sampler = vulkanSamplers[i];
-			tex_desc[i].imageView = vulkanTextures[i]->impl.texture.view;
-			texture_count++;
-		}
-		else if (vulkanRenderTargets[i] != NULL) {
-			tex_desc[i].sampler = vulkanSamplers[i];
-			if (vulkanRenderTargets[i]->impl.stage_depth == i) {
-				tex_desc[i].imageView = vulkanRenderTargets[i]->impl.depthView;
-				vulkanRenderTargets[i]->impl.stage_depth = -1;
-			}
-			else {
-				tex_desc[i].imageView = vulkanRenderTargets[i]->impl.sourceView;
-			}
-			texture_count++;
-		}
-		tex_desc[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-	}
+	write_tex_descs(tex_desc);
 
 	VkWriteDescriptorSet writes[18];
 	memset(&writes, 0, sizeof(writes));
@@ -940,26 +907,27 @@ VkDescriptorSet getDescriptorSet() {
 		writes[i].pImageInfo = &tex_desc[i - 2];
 	}
 
-	if (vulkanTextures[0] != NULL || vulkanRenderTargets[0] != NULL) {
-		if (vk_ctx.vertex_uniform_buffer != NULL && vk_ctx.fragment_uniform_buffer != NULL) {
-			vkUpdateDescriptorSets(vk_ctx.device, 2 + texture_count, writes, 0, NULL);
-		}
-		else {
-			vkUpdateDescriptorSets(vk_ctx.device, texture_count, writes + 2, 0, NULL);
-		}
+	if (vk_ctx.vertex_uniform_buffer != NULL && vk_ctx.fragment_uniform_buffer != NULL) {
+		vkUpdateDescriptorSets(vk_ctx.device, 18, writes, 0, NULL);
 	}
 	else {
-		if (vk_ctx.vertex_uniform_buffer != NULL && vk_ctx.fragment_uniform_buffer != NULL) {
-			vkUpdateDescriptorSets(vk_ctx.device, 2, writes, 0, NULL);
-		}
+		vkUpdateDescriptorSets(vk_ctx.device, 16, writes + 2, 0, NULL);
 	}
 
-	assert(descriptor_sets_count + 1 < MAX_DESCRIPTOR_SETS);
-	descriptor_sets[descriptor_sets_count].id = id;
-	descriptor_sets[descriptor_sets_count].in_use = true;
-	descriptor_sets[descriptor_sets_count].set = descriptor_set;
-	write_tex_descs(descriptor_sets[descriptor_sets_count].tex_desc);
-	descriptor_sets_count += 1;
+	if (descriptor_sets_count < GRAPHICS_DESCRIPTOR_SET_COUNT) {
+		descriptor_sets[descriptor_sets_count].id = id;
+		descriptor_sets[descriptor_sets_count].in_use = true;
+		descriptor_sets[descriptor_sets_count].set = descriptor_set;
+		memcpy(descriptor_sets[descriptor_sets_count].tex_desc, tex_desc, sizeof(tex_desc));
+		descriptor_sets_count += 1;
+	}
+	else {
+		static bool warned = false;
+		if (!warned) {
+			kinc_log(KINC_LOG_LEVEL_WARNING, "Vulkan descriptor set cache full (%d), sets are no longer recycled.", GRAPHICS_DESCRIPTOR_SET_COUNT);
+			warned = true;
+		}
+	}
 
 	return descriptor_set;
 }
@@ -979,9 +947,8 @@ static int write_compute_tex_descs(VkDescriptorImageInfo *tex_descs) {
 		}
 		else if (vulkanRenderTargets[i] != NULL) {
 			tex_descs[i].sampler = vulkanSamplers[i];
-			if (vulkanRenderTargets[i]->impl.stage_depth == i) {
+			if (vulkanRenderTargetsDepth[i]) {
 				tex_descs[i].imageView = vulkanRenderTargets[i]->impl.depthView;
-				vulkanRenderTargets[i]->impl.stage_depth = -1;
 			}
 			else {
 				tex_descs[i].imageView = vulkanRenderTargets[i]->impl.sourceView;
@@ -1085,9 +1052,8 @@ static VkDescriptorSet get_compute_descriptor_set() {
 		}
 		else if (vulkanRenderTargets[i] != NULL) {
 			tex_desc[i].sampler = vulkanSamplers[i];
-			if (vulkanRenderTargets[i]->impl.stage_depth == i) {
+			if (vulkanRenderTargetsDepth[i]) {
 				tex_desc[i].imageView = vulkanRenderTargets[i]->impl.depthView;
-				vulkanRenderTargets[i]->impl.stage_depth = -1;
 			}
 			else {
 				tex_desc[i].imageView = vulkanRenderTargets[i]->impl.sourceView;

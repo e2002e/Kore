@@ -97,6 +97,9 @@ static void render_target_init(kinc_g5_render_target_t *target, int width, int h
 	target->impl.stage = 0;
 	target->impl.stage_depth = -1;
 	target->impl.readbackBufferCreated = false;
+	target->impl.depth_borrowed = false;
+	target->impl.is_cube = false;
+	target->impl.current_face = 0;
 
 	if (framebuffer_index < 0) {
 		{
@@ -154,8 +157,8 @@ static void render_target_init(kinc_g5_render_target_t *target, int width, int h
 			assert(!err);
 
 			setup_init_cmd();
-			setImageLayout(vk_ctx.setup_cmd, target->impl.sourceImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-			               VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+			// Render targets stay in GENERAL for their whole life (attachment and sampling), see rtcache.c.h
+			setImageLayout(vk_ctx.setup_cmd, target->impl.sourceImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
 			flush_init_cmd();
 
 			colorImageView.image = target->impl.sourceImage;
@@ -164,7 +167,7 @@ static void render_target_init(kinc_g5_render_target_t *target, int width, int h
 		}
 
 		if (depthBufferBits > 0) {
-			const VkFormat depth_format = VK_FORMAT_D16_UNORM;
+			const VkFormat depth_format = KINC_VK_RENDER_TARGET_DEPTH_FORMAT;
 			VkImageCreateInfo image = {0};
 			image.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 			image.pNext = NULL;
@@ -222,8 +225,7 @@ static void render_target_init(kinc_g5_render_target_t *target, int width, int h
 			assert(!err);
 
 			setup_init_cmd();
-			setImageLayout(vk_ctx.setup_cmd, target->impl.depthImage, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-			               VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+			setImageLayout(vk_ctx.setup_cmd, target->impl.depthImage, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
 			flush_init_cmd();
 
 			/* create image view */
@@ -231,33 +233,8 @@ static void render_target_init(kinc_g5_render_target_t *target, int width, int h
 			assert(!err);
 		}
 
-		VkImageView attachments[2];
-		attachments[0] = target->impl.sourceView;
-
-		if (depthBufferBits > 0) {
-			attachments[1] = target->impl.depthView;
-		}
-
-		VkFramebufferCreateInfo fbufCreateInfo = {0};
-		fbufCreateInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-		fbufCreateInfo.pNext = NULL;
-		if (framebuffer_index >= 0) {
-			fbufCreateInfo.renderPass = vk_ctx.windows[vk_ctx.current_window].framebuffer_render_pass;
-		}
-		else if (depthBufferBits > 0) {
-			fbufCreateInfo.renderPass = vk_ctx.windows[vk_ctx.current_window].rendertarget_render_pass_with_depth;
-		}
-		else {
-			fbufCreateInfo.renderPass = vk_ctx.windows[vk_ctx.current_window].rendertarget_render_pass;
-		}
-		fbufCreateInfo.attachmentCount = depthBufferBits > 0 ? 2 : 1;
-		fbufCreateInfo.pAttachments = attachments;
-		fbufCreateInfo.width = width;
-		fbufCreateInfo.height = height;
-		fbufCreateInfo.layers = 1;
-
-		VkResult err = vkCreateFramebuffer(vk_ctx.device, &fbufCreateInfo, NULL, &target->impl.framebuffer);
-		assert(!err);
+		// Framebuffers are created on demand per render pass (get_rt_framebuffer)
+		target->impl.framebuffer = VK_NULL_HANDLE;
 	}
 }
 
@@ -274,16 +251,118 @@ void kinc_g5_render_target_init_framebuffer_with_multisampling(kinc_g5_render_ta
 	framebuffer_count += 1;
 }
 
+static void create_cube_image(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect, int size, VkImage *image, VkDeviceMemory *memory,
+                              VkImageView *cube_view, VkImageView *face_views) {
+	VkImageCreateInfo info = {0};
+	info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+	info.imageType = VK_IMAGE_TYPE_2D;
+	info.format = format;
+	info.extent.width = size;
+	info.extent.height = size;
+	info.extent.depth = 1;
+	info.mipLevels = 1;
+	info.arrayLayers = 6;
+	info.samples = VK_SAMPLE_COUNT_1_BIT;
+	info.tiling = VK_IMAGE_TILING_OPTIMAL;
+	info.usage = usage;
+	VkResult err = vkCreateImage(vk_ctx.device, &info, NULL, image);
+	assert(!err);
+
+	VkMemoryRequirements reqs;
+	vkGetImageMemoryRequirements(vk_ctx.device, *image, &reqs);
+	VkMemoryAllocateInfo alloc = {0};
+	alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	alloc.allocationSize = reqs.size;
+	bool pass = memory_type_from_properties(reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &alloc.memoryTypeIndex);
+	assert(pass);
+	err = vkAllocateMemory(vk_ctx.device, &alloc, NULL, memory);
+	assert(!err);
+	err = vkBindImageMemory(vk_ctx.device, *image, *memory, 0);
+	assert(!err);
+
+	// All 6 layers to GENERAL, like every other render target
+	setup_init_cmd();
+	VkImageMemoryBarrier barrier = {0};
+	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image = *image;
+	barrier.subresourceRange.aspectMask = aspect;
+	barrier.subresourceRange.levelCount = 1;
+	barrier.subresourceRange.layerCount = 6;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	vkCmdPipelineBarrier(vk_ctx.setup_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+	flush_init_cmd();
+
+	VkImageViewCreateInfo view = {0};
+	view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	view.image = *image;
+	view.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+	view.format = format;
+	view.subresourceRange.aspectMask = aspect;
+	view.subresourceRange.levelCount = 1;
+	view.subresourceRange.layerCount = 6;
+	err = vkCreateImageView(vk_ctx.device, &view, NULL, cube_view);
+	assert(!err);
+
+	view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	view.subresourceRange.layerCount = 1;
+	for (int face = 0; face < 6; ++face) {
+		view.subresourceRange.baseArrayLayer = face;
+		err = vkCreateImageView(vk_ctx.device, &view, NULL, &face_views[face]);
+		assert(!err);
+	}
+}
+
 void kinc_g5_render_target_init_cube_with_multisampling(kinc_g5_render_target_t *target, int cubeMapSize, kinc_g5_render_target_format_t format,
-                                                        int depthBufferBits, int stencilBufferBits, int samples_per_pixel) {}
+                                                        int depthBufferBits, int stencilBufferBits, int samples_per_pixel) {
+	memset(&target->impl, 0, sizeof(target->impl));
+	target->width = cubeMapSize;
+	target->height = cubeMapSize;
+	target->texWidth = cubeMapSize;
+	target->texHeight = cubeMapSize;
+	target->framebuffer_index = -1;
+	target->isCubeMap = true;
+	target->impl.format = convert_format(format);
+	target->impl.depthBufferBits = depthBufferBits;
+	target->impl.stage_depth = -1;
+	target->impl.is_cube = true;
+	target->impl.current_face = 0;
+
+	create_cube_image(target->impl.format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	                  VK_IMAGE_ASPECT_COLOR_BIT, cubeMapSize, &target->impl.sourceImage, &target->impl.sourceMemory, &target->impl.sourceView,
+	                  target->impl.face_views);
+	if (depthBufferBits > 0) {
+		create_cube_image(KINC_VK_RENDER_TARGET_DEPTH_FORMAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		                  VK_IMAGE_ASPECT_DEPTH_BIT, cubeMapSize, &target->impl.depthImage, &target->impl.depthMemory, &target->impl.depthView,
+		                  target->impl.face_depth_views);
+	}
+	target->impl.framebuffer = VK_NULL_HANDLE;
+}
 
 void kinc_g5_render_target_destroy(kinc_g5_render_target_t *target) {
 	if (target->framebuffer_index >= 0) {
 		framebuffer_count -= 1;
 	}
 	else {
-		vkDestroyFramebuffer(vk_ctx.device, target->impl.framebuffer, NULL);
-		if (target->impl.depthBufferBits > 0) {
+		// Rare; make sure nothing in flight still uses the images or their framebuffers
+		vkQueueWaitIdle(vk_ctx.queue);
+		release_rt_framebuffers_using(target->impl.sourceView);
+		if (target->impl.is_cube) {
+			for (int face = 0; face < 6; ++face) {
+				release_rt_framebuffers_using(target->impl.face_views[face]);
+				vkDestroyImageView(vk_ctx.device, target->impl.face_views[face], NULL);
+				if (target->impl.depthBufferBits > 0) {
+					release_rt_framebuffers_using(target->impl.face_depth_views[face]);
+					vkDestroyImageView(vk_ctx.device, target->impl.face_depth_views[face], NULL);
+				}
+			}
+		}
+		if (target->impl.depthBufferBits > 0 && !target->impl.depth_borrowed) {
+			release_rt_framebuffers_using(target->impl.depthView);
 			vkDestroyImageView(vk_ctx.device, target->impl.depthView, NULL);
 			vkDestroyImage(vk_ctx.device, target->impl.depthImage, NULL);
 			vkFreeMemory(vk_ctx.device, target->impl.depthMemory, NULL);
@@ -299,33 +378,6 @@ void kinc_g5_render_target_set_depth_stencil_from(kinc_g5_render_target_t *targe
 	target->impl.depthMemory = source->impl.depthMemory;
 	target->impl.depthView = source->impl.depthView;
 	target->impl.depthBufferBits = source->impl.depthBufferBits;
-
-	// vkDestroyFramebuffer(vk_ctx.device, target->impl.framebuffer, nullptr);
-
-	{
-		VkImageView attachments[2];
-		attachments[0] = target->impl.sourceView;
-
-		if (target->impl.depthBufferBits > 0) {
-			attachments[1] = target->impl.depthView;
-		}
-
-		VkFramebufferCreateInfo fbufCreateInfo = {0};
-		fbufCreateInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-		fbufCreateInfo.pNext = NULL;
-		if (target->impl.depthBufferBits > 0) {
-			fbufCreateInfo.renderPass = vk_ctx.windows[vk_ctx.current_window].rendertarget_render_pass_with_depth;
-		}
-		else {
-			fbufCreateInfo.renderPass = vk_ctx.windows[vk_ctx.current_window].rendertarget_render_pass;
-		}
-		fbufCreateInfo.attachmentCount = target->impl.depthBufferBits > 0 ? 2 : 1;
-		fbufCreateInfo.pAttachments = attachments;
-		fbufCreateInfo.width = target->width;
-		fbufCreateInfo.height = target->height;
-		fbufCreateInfo.layers = 1;
-
-		VkResult err = vkCreateFramebuffer(vk_ctx.device, &fbufCreateInfo, NULL, &target->impl.framebuffer);
-		assert(!err);
-	}
+	// The source owns the depth image; framebuffers pick up the new view via the cache key
+	target->impl.depth_borrowed = true;
 }

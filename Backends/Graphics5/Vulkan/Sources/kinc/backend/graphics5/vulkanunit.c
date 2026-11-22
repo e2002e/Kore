@@ -76,6 +76,7 @@ static VkDescriptorSetLayout compute_descriptor_layout;
 
 #include "ShaderHash.c.h"
 #include "Vulkan.c.h"
+#include "rtcache.c.h"
 #include "commandlist.c.h"
 #include "compute.c.h"
 #include "constantbuffer.c.h"

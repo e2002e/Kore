@@ -175,7 +175,17 @@ void kinc_g5_compute_shader_init(kinc_g5_compute_shader *shader, void *_data, in
 	}*/
 }
 
-void kinc_g5_compute_shader_destroy(kinc_g5_compute_shader *shader) {}
+void kinc_g5_compute_shader_destroy(kinc_g5_compute_shader *shader) {
+	if (current_compute_shader == shader) {
+		current_compute_shader = NULL;
+	}
+	if (shader->impl.pipeline != VK_NULL_HANDLE || shader->impl.pipeline_layout != VK_NULL_HANDLE) {
+		queue_pipeline_release(shader->impl.pipeline, shader->impl.pipeline_layout);
+	}
+	shader->impl.pipeline = VK_NULL_HANDLE;
+	shader->impl.pipeline_layout = VK_NULL_HANDLE;
+	shader->impl.shader_module = VK_NULL_HANDLE; // already destroyed in init
+}
 
 kinc_g5_constant_location_t kinc_g5_compute_shader_get_constant_location(kinc_g5_compute_shader *shader, const char *name) {
 	kinc_g5_constant_location_t location = {0};

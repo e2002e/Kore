@@ -12,6 +12,7 @@
 
 extern kinc_g5_texture_t *vulkanTextures[16];
 extern kinc_g5_render_target_t *vulkanRenderTargets[16];
+extern bool vulkanRenderTargetsDepth[16];
 VkDescriptorSet getDescriptorSet(void);
 static VkDescriptorSet get_compute_descriptor_set(void);
 bool memory_type_from_properties(uint32_t typeBits, VkFlags requirements_mask, uint32_t *typeIndex);
@@ -27,11 +28,79 @@ static uint32_t lastFragmentConstantBufferOffset = 0;
 static uint32_t lastComputeConstantBufferOffset = 0;
 static kinc_g5_pipeline_t *currentPipeline = NULL;
 static kinc_g5_compute_shader *current_compute_shader = NULL;
-static int mrtIndex = 0;
-static VkFramebuffer mrtFramebuffer[16];
-static VkRenderPass mrtRenderPass[16];
+
+// Pipelines (graphics and compute) can't be freed on destroy: the command buffer being recorded (or
+// one in flight) may still reference them. Queue them and free once the queue is idle, at the next
+// list begin. Either handle may be VK_NULL_HANDLE.
+typedef struct {
+	VkPipeline pipeline;
+	VkPipelineLayout layout;
+} pending_pipeline_release;
+static pending_pipeline_release *pending_pipeline_releases = NULL;
+static int pending_pipeline_release_count = 0;
+static int pending_pipeline_release_capacity = 0;
+
+static void queue_pipeline_release(VkPipeline pipeline, VkPipelineLayout layout) {
+	if (pending_pipeline_release_count == pending_pipeline_release_capacity) {
+		int capacity = pending_pipeline_release_capacity == 0 ? 16 : pending_pipeline_release_capacity * 2;
+		pending_pipeline_release *grown = (pending_pipeline_release *)realloc(pending_pipeline_releases, capacity * sizeof(pending_pipeline_release));
+		if (grown == NULL) {
+			// Out of memory: fall back to a blocking release
+			vkDeviceWaitIdle(vk_ctx.device);
+			vkDestroyPipeline(vk_ctx.device, pipeline, NULL);
+			vkDestroyPipelineLayout(vk_ctx.device, layout, NULL);
+			return;
+		}
+		pending_pipeline_releases = grown;
+		pending_pipeline_release_capacity = capacity;
+	}
+	pending_pipeline_releases[pending_pipeline_release_count].pipeline = pipeline;
+	pending_pipeline_releases[pending_pipeline_release_count].layout = layout;
+	++pending_pipeline_release_count;
+}
+
+static void flush_pipeline_releases(void) {
+	if (pending_pipeline_release_count == 0) {
+		return;
+	}
+	// Rare (only after a pipeline or compute shader was destroyed), so a full idle wait is acceptable.
+	// Assumes no other command list is mid-recording with a destroyed shader (G4onG5 uses one list).
+	vkQueueWaitIdle(vk_ctx.queue);
+	for (int i = 0; i < pending_pipeline_release_count; ++i) {
+		vkDestroyPipeline(vk_ctx.device, pending_pipeline_releases[i].pipeline, NULL);
+		vkDestroyPipelineLayout(vk_ctx.device, pending_pipeline_releases[i].layout, NULL);
+	}
+	pending_pipeline_release_count = 0;
+}
+
+VkPipeline kinc_vulkan_internal_get_pipeline(kinc_g5_pipeline_t *pipeline, VkRenderPass pass, int color_count);
+
+// Render pass the current/next draws are recorded in, and its color attachment count
+static VkRenderPass current_render_pass = VK_NULL_HANDLE;
+static int current_color_count = 1;
+static bool current_pass_has_depth = false;
 
 static bool in_render_pass = false;
+
+// Asserts are compiled out in release builds; a lost device would otherwise go unnoticed and every
+// later wait would "succeed" immediately.
+static void check_fence_wait(VkResult err) {
+	static bool reported = false;
+	if (err != VK_SUCCESS && !reported) {
+		kinc_log(KINC_LOG_LEVEL_ERROR, "Vulkan fence wait failed (%d)%s", (int)err, err == VK_ERROR_DEVICE_LOST ? ": device lost" : "");
+		reported = true;
+	}
+}
+
+static void bind_current_pipeline(kinc_g5_command_list_t *list) {
+	if (currentPipeline == NULL || current_render_pass == VK_NULL_HANDLE) {
+		return;
+	}
+	currentVulkanPipeline = kinc_vulkan_internal_get_pipeline(currentPipeline, current_render_pass, current_color_count);
+	if (currentVulkanPipeline != VK_NULL_HANDLE) {
+		vkCmdBindPipeline(list->impl._buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, currentVulkanPipeline);
+	}
+}
 
 static void endPass(kinc_g5_command_list_t *list) {
 	if (in_render_pass) {
@@ -42,6 +111,7 @@ static void endPass(kinc_g5_command_list_t *list) {
 	for (int i = 0; i < 16; ++i) {
 		vulkanTextures[i] = NULL;
 		vulkanRenderTargets[i] = NULL;
+		vulkanRenderTargetsDepth[i] = false;
 	}
 }
 
@@ -199,21 +269,21 @@ void set_viewport_and_scissor(kinc_g5_command_list_t *list) {
 
 	if (currentRenderTargets[0] == NULL || currentRenderTargets[0]->framebuffer_index >= 0) {
 		viewport.x = 0;
-		viewport.y = (float)kinc_window_height(vk_ctx.current_window);
-		viewport.width = (float)kinc_window_width(vk_ctx.current_window);
-		viewport.height = -(float)kinc_window_height(vk_ctx.current_window);
+		viewport.y = (float)vk_ctx.windows[vk_ctx.current_window].height;
+		viewport.width = (float)vk_ctx.windows[vk_ctx.current_window].width;
+		viewport.height = -(float)vk_ctx.windows[vk_ctx.current_window].height;
 		viewport.minDepth = (float)0.0f;
 		viewport.maxDepth = (float)1.0f;
-		scissor.extent.width = kinc_window_width(vk_ctx.current_window);
-		scissor.extent.height = kinc_window_height(vk_ctx.current_window);
+		scissor.extent.width = vk_ctx.windows[vk_ctx.current_window].width;
+		scissor.extent.height = vk_ctx.windows[vk_ctx.current_window].height;
 		scissor.offset.x = 0;
 		scissor.offset.y = 0;
 	}
 	else {
 		viewport.x = 0;
-		viewport.y = (float)currentRenderTargets[0]->height;
+		viewport.y = 0; // offscreen targets are not y-flipped (see set_render_targets)
 		viewport.width = (float)currentRenderTargets[0]->width;
-		viewport.height = -(float)currentRenderTargets[0]->height;
+		viewport.height = (float)currentRenderTargets[0]->height;
 		viewport.minDepth = (float)0.0f;
 		viewport.maxDepth = (float)1.0f;
 		scissor.extent.width = currentRenderTargets[0]->width;
@@ -254,7 +324,9 @@ void kinc_g5_command_list_destroy(kinc_g5_command_list_t *list) {
 
 void kinc_g5_command_list_begin(kinc_g5_command_list_t *list) {
 	VkResult err = vkWaitForFences(vk_ctx.device, 1, &list->impl.fence, VK_TRUE, UINT64_MAX);
-	assert(!err);
+	check_fence_wait(err);
+
+	flush_pipeline_releases();
 
 	vkResetCommandBuffer(list->impl._buffer, 0);
 	VkCommandBufferBeginInfo cmd_buf_info = {0};
@@ -312,16 +384,12 @@ void kinc_g5_command_list_begin(kinc_g5_command_list_t *list) {
 	vkCmdBeginRenderPass(list->impl._buffer, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 	currentRenderPassBeginInfo = rp_begin;
 	in_render_pass = true;
+	current_render_pass = rp_begin.renderPass;
+	current_color_count = 1;
 
 	set_viewport_and_scissor(list);
 
 	onBackBuffer = true;
-
-	for (int i = 0; i < mrtIndex; ++i) {
-		vkDestroyFramebuffer(vk_ctx.device, mrtFramebuffer[i], NULL);
-		vkDestroyRenderPass(vk_ctx.device, mrtRenderPass[i], NULL);
-	}
-	mrtIndex = 0;
 }
 
 void kinc_g5_command_list_end(kinc_g5_command_list_t *list) {
@@ -352,34 +420,44 @@ void kinc_g5_command_list_end(kinc_g5_command_list_t *list) {
 
 void kinc_g5_command_list_clear(kinc_g5_command_list_t *list, struct kinc_g5_render_target *renderTarget, unsigned flags, unsigned color, float depth,
                                 int stencil) {
+	if (!in_render_pass) {
+		return;
+	}
 	VkClearRect clearRect = {0};
 	clearRect.rect.offset.x = 0;
 	clearRect.rect.offset.y = 0;
-	clearRect.rect.extent.width = renderTarget->width;
-	clearRect.rect.extent.height = renderTarget->height;
+	// The bound pass decides what gets cleared; the passed target can be stale (e.g. after a cube face switch)
+	clearRect.rect.extent = currentRenderPassBeginInfo.renderArea.extent;
 	clearRect.baseArrayLayer = 0;
 	clearRect.layerCount = 1;
 
 	int count = 0;
-	VkClearAttachment attachments[2];
+	VkClearAttachment attachments[9];
 	if (flags & KINC_G5_CLEAR_COLOR) {
 		VkClearColorValue clearColor = {0};
 		clearColor.float32[0] = ((color & 0x00ff0000) >> 16) / 255.0f;
 		clearColor.float32[1] = ((color & 0x0000ff00) >> 8) / 255.0f;
 		clearColor.float32[2] = (color & 0x000000ff) / 255.0f;
 		clearColor.float32[3] = ((color & 0xff000000) >> 24) / 255.0f;
-		attachments[count].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		attachments[count].colorAttachment = 0;
-		attachments[count].clearValue.color = clearColor;
-		count++;
+		// Like GL, a color clear clears every bound color target (MRT)
+		int color_count = onBackBuffer ? 1 : current_color_count;
+		for (int i = 0; i < color_count; ++i) {
+			attachments[count].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			attachments[count].colorAttachment = i;
+			attachments[count].clearValue.color = clearColor;
+			count++;
+		}
 	}
-	if (((flags & KINC_G5_CLEAR_DEPTH) || (flags & KINC_G5_CLEAR_STENCIL)) && renderTarget->impl.depthBufferBits > 0) {
+	bool pass_has_depth = onBackBuffer ? vk_ctx.windows[vk_ctx.current_window].depth_bits > 0 : current_pass_has_depth;
+	if (((flags & KINC_G5_CLEAR_DEPTH) || (flags & KINC_G5_CLEAR_STENCIL)) && pass_has_depth) {
 		attachments[count].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT; // | VK_IMAGE_ASPECT_STENCIL_BIT;
 		attachments[count].clearValue.depthStencil.depth = depth;
 		attachments[count].clearValue.depthStencil.stencil = stencil;
 		count++;
 	}
-	vkCmdClearAttachments(list->impl._buffer, count, attachments, 1, &clearRect);
+	if (count > 0) {
+		vkCmdClearAttachments(list->impl._buffer, count, attachments, 1, &clearRect);
+	}
 }
 
 void kinc_g5_command_list_render_target_to_framebuffer_barrier(kinc_g5_command_list_t *list, struct kinc_g5_render_target *renderTarget) {}
@@ -410,9 +488,15 @@ void kinc_g5_command_list_viewport(kinc_g5_command_list_t *list, int x, int y, i
 	VkViewport viewport;
 	memset(&viewport, 0, sizeof(viewport));
 	viewport.x = (float)x;
-	viewport.y = y + (float)height;
+	if (onBackBuffer) {
+		viewport.y = y + (float)height;
+		viewport.height = (float)-height;
+	}
+	else {
+		viewport.y = (float)y;
+		viewport.height = (float)height;
+	}
 	viewport.width = (float)width;
-	viewport.height = (float)-height;
 	viewport.minDepth = (float)0.0f;
 	viewport.maxDepth = (float)1.0f;
 	vkCmdSetViewport(list->impl._buffer, 0, 1, &viewport);
@@ -432,8 +516,8 @@ void kinc_g5_command_list_disable_scissor(kinc_g5_command_list_t *list) {
 	VkRect2D scissor;
 	memset(&scissor, 0, sizeof(scissor));
 	if (currentRenderTargets[0] == NULL || currentRenderTargets[0]->framebuffer_index >= 0) {
-		scissor.extent.width = kinc_window_width(vk_ctx.current_window);
-		scissor.extent.height = kinc_window_height(vk_ctx.current_window);
+		scissor.extent.width = vk_ctx.windows[vk_ctx.current_window].width;
+		scissor.extent.height = vk_ctx.windows[vk_ctx.current_window].height;
 	}
 	else {
 		scissor.extent.width = currentRenderTargets[0]->width;
@@ -447,14 +531,7 @@ void kinc_g5_command_list_set_pipeline(kinc_g5_command_list_t *list, struct kinc
 	lastVertexConstantBufferOffset = 0;
 	lastFragmentConstantBufferOffset = 0;
 
-	if (onBackBuffer) {
-		currentVulkanPipeline = currentPipeline->impl.framebuffer_pipeline;
-		vkCmdBindPipeline(list->impl._buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, currentPipeline->impl.framebuffer_pipeline);
-	}
-	else {
-		currentVulkanPipeline = currentPipeline->impl.rendertarget_pipeline;
-		vkCmdBindPipeline(list->impl._buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, currentPipeline->impl.rendertarget_pipeline);
-	}
+	bind_current_pipeline(list);
 }
 
 void kinc_g5_command_list_set_blend_constant(kinc_g5_command_list_t *list, float r, float g, float b, float a) {
@@ -489,16 +566,16 @@ void kinc_internal_restore_render_target(kinc_g5_command_list_t *list, struct ki
 	VkViewport viewport;
 	memset(&viewport, 0, sizeof(viewport));
 	viewport.x = 0;
-	viewport.y = (float)kinc_window_height(vk_ctx.current_window);
-	viewport.width = (float)kinc_window_width(vk_ctx.current_window);
-	viewport.height = -(float)kinc_window_height(vk_ctx.current_window);
+	viewport.y = (float)vk_ctx.windows[vk_ctx.current_window].height;
+	viewport.width = (float)vk_ctx.windows[vk_ctx.current_window].width;
+	viewport.height = -(float)vk_ctx.windows[vk_ctx.current_window].height;
 	viewport.minDepth = (float)0.0f;
 	viewport.maxDepth = (float)1.0f;
 	vkCmdSetViewport(list->impl._buffer, 0, 1, &viewport);
 	VkRect2D scissor;
 	memset(&scissor, 0, sizeof(scissor));
-	scissor.extent.width = kinc_window_width(vk_ctx.current_window);
-	scissor.extent.height = kinc_window_height(vk_ctx.current_window);
+	scissor.extent.width = vk_ctx.windows[vk_ctx.current_window].width;
+	scissor.extent.height = vk_ctx.windows[vk_ctx.current_window].height;
 	scissor.offset.x = 0;
 	scissor.offset.y = 0;
 	vkCmdSetScissor(list->impl._buffer, 0, 1, &scissor);
@@ -527,18 +604,17 @@ void kinc_internal_restore_render_target(kinc_g5_command_list_t *list, struct ki
 	rp_begin.framebuffer = vk_ctx.windows[vk_ctx.current_window].framebuffers[vk_ctx.windows[vk_ctx.current_window].current_image];
 	rp_begin.renderArea.offset.x = 0;
 	rp_begin.renderArea.offset.y = 0;
-	rp_begin.renderArea.extent.width = kinc_window_width(vk_ctx.current_window);
-	rp_begin.renderArea.extent.height = kinc_window_height(vk_ctx.current_window);
+	rp_begin.renderArea.extent.width = vk_ctx.windows[vk_ctx.current_window].width;
+	rp_begin.renderArea.extent.height = vk_ctx.windows[vk_ctx.current_window].height;
 	rp_begin.clearValueCount = 2;
 	rp_begin.pClearValues = clear_values;
 	vkCmdBeginRenderPass(list->impl._buffer, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 	currentRenderPassBeginInfo = rp_begin;
 	in_render_pass = true;
+	current_render_pass = rp_begin.renderPass;
+	current_color_count = 1;
 
-	if (currentPipeline != NULL) {
-		currentVulkanPipeline = currentPipeline->impl.framebuffer_pipeline;
-		vkCmdBindPipeline(list->impl._buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, currentPipeline->impl.framebuffer_pipeline);
-	}
+	bind_current_pipeline(list);
 }
 
 void kinc_g5_command_list_set_render_targets(kinc_g5_command_list_t *list, struct kinc_g5_render_target **targets, int count) {
@@ -579,132 +655,35 @@ void kinc_g5_command_list_set_render_targets(kinc_g5_command_list_t *list, struc
 	rp_begin.clearValueCount = count + 1;
 	rp_begin.pClearValues = clear_values;
 
-	if (count == 1) {
-		if (targets[0]->impl.depthBufferBits > 0) {
-			rp_begin.renderPass = vk_ctx.windows[vk_ctx.current_window].rendertarget_render_pass_with_depth;
-		}
-		else {
-			rp_begin.renderPass = vk_ctx.windows[vk_ctx.current_window].rendertarget_render_pass;
-		}
-		rp_begin.framebuffer = targets[0]->impl.framebuffer;
+	VkFormat formats[8];
+	VkImageView views[9];
+	for (int i = 0; i < count; ++i) {
+		formats[i] = targets[i]->impl.format;
+		views[i] = targets[i]->impl.is_cube ? targets[i]->impl.face_views[targets[i]->impl.current_face] : targets[i]->impl.sourceView;
 	}
-	else {
-		VkAttachmentDescription attachments[9];
-		for (int i = 0; i < count; ++i) {
-			attachments[i].format = targets[i]->impl.format;
-			attachments[i].samples = VK_SAMPLE_COUNT_1_BIT;
-			attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-			attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-			attachments[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-			attachments[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-			attachments[i].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-			attachments[i].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-			attachments[i].flags = 0;
-		}
-
-		if (targets[0]->impl.depthBufferBits > 0) {
-			attachments[count].format = VK_FORMAT_D16_UNORM;
-			attachments[count].samples = VK_SAMPLE_COUNT_1_BIT;
-			attachments[count].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-			attachments[count].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-			attachments[count].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-			attachments[count].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-			attachments[count].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-			attachments[count].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-			attachments[count].flags = 0;
-		}
-
-		VkAttachmentReference color_references[8];
-		for (int i = 0; i < count; ++i) {
-			color_references[i].attachment = i;
-			color_references[i].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-		}
-
-		VkAttachmentReference depth_reference = {0};
-		depth_reference.attachment = count;
-		depth_reference.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-		VkSubpassDescription subpass = {0};
-		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-		subpass.flags = 0;
-		subpass.inputAttachmentCount = 0;
-		subpass.pInputAttachments = NULL;
-		subpass.colorAttachmentCount = count;
-		subpass.pColorAttachments = color_references;
-		subpass.pResolveAttachments = NULL;
-		subpass.pDepthStencilAttachment = targets[0]->impl.depthBufferBits > 0 ? &depth_reference : NULL;
-		subpass.preserveAttachmentCount = 0;
-		subpass.pPreserveAttachments = NULL;
-
-		VkSubpassDependency dependencies[2];
-		memset(&dependencies, 0, sizeof(dependencies));
-
-		// TODO: For multi-targets-rendering
-		dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-		dependencies[0].dstSubpass = 0;
-		dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-		dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-		dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-		dependencies[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
-
-		dependencies[1].srcSubpass = 0;
-		dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-		dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-		dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-		dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-		dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		dependencies[1].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
-
-		VkRenderPassCreateInfo rp_info = {0};
-		rp_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-		rp_info.pNext = NULL;
-		rp_info.attachmentCount = targets[0]->impl.depthBufferBits > 0 ? count + 1 : count;
-		rp_info.pAttachments = attachments;
-		rp_info.subpassCount = 1;
-		rp_info.pSubpasses = &subpass;
-		rp_info.dependencyCount = 2;
-		rp_info.pDependencies = dependencies;
-
-		VkResult err = vkCreateRenderPass(vk_ctx.device, &rp_info, NULL, &mrtRenderPass[mrtIndex]);
-		assert(!err);
-
-		VkImageView attachmentsViews[9];
-		for (int i = 0; i < count; ++i) {
-			attachmentsViews[i] = targets[i]->impl.sourceView;
-		}
-		if (targets[0]->impl.depthBufferBits > 0) {
-			attachmentsViews[count] = targets[0]->impl.depthView;
-		}
-
-		VkFramebufferCreateInfo fbufCreateInfo = {0};
-		fbufCreateInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-		fbufCreateInfo.pNext = NULL;
-		fbufCreateInfo.renderPass = mrtRenderPass[mrtIndex];
-		fbufCreateInfo.attachmentCount = targets[0]->impl.depthBufferBits > 0 ? count + 1 : count;
-		fbufCreateInfo.pAttachments = attachmentsViews;
-		fbufCreateInfo.width = targets[0]->width;
-		fbufCreateInfo.height = targets[0]->height;
-		fbufCreateInfo.layers = 1;
-
-		err = vkCreateFramebuffer(vk_ctx.device, &fbufCreateInfo, NULL, &mrtFramebuffer[mrtIndex]);
-		assert(!err);
-
-		rp_begin.renderPass = mrtRenderPass[mrtIndex];
-		rp_begin.framebuffer = mrtFramebuffer[mrtIndex];
-		mrtIndex++;
+	bool depth = targets[0]->impl.depthBufferBits > 0;
+	if (depth) {
+		views[count] = targets[0]->impl.is_cube ? targets[0]->impl.face_depth_views[targets[0]->impl.current_face] : targets[0]->impl.depthView;
 	}
+	current_pass_has_depth = depth;
+	rp_begin.renderPass = get_rt_render_pass(formats, count, depth);
+	rp_begin.framebuffer = get_rt_framebuffer(rp_begin.renderPass, views, depth ? count + 1 : count, targets[0]->width, targets[0]->height);
 
 	vkCmdBeginRenderPass(list->impl._buffer, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 	currentRenderPassBeginInfo = rp_begin;
 	in_render_pass = true;
+	current_render_pass = rp_begin.renderPass;
+	current_color_count = count;
 
+	// Offscreen targets are not y-flipped: with a positive viewport their memory layout matches GL
+	// (row 0 = NDC y -1 = texture v 0), so sampling and gl_FragCoord behave as on GL. Only the back
+	// buffer is flipped; pipeline variants pick the matching front face (create_pipeline_variant).
 	VkViewport viewport;
 	memset(&viewport, 0, sizeof(viewport));
 	viewport.x = 0;
-	viewport.y = (float)targets[0]->height;
+	viewport.y = 0;
 	viewport.width = (float)targets[0]->width;
-	viewport.height = -(float)targets[0]->height;
+	viewport.height = (float)targets[0]->height;
 	viewport.minDepth = (float)0.0f;
 	viewport.maxDepth = (float)1.0f;
 	vkCmdSetViewport(list->impl._buffer, 0, 1, &viewport);
@@ -717,10 +696,7 @@ void kinc_g5_command_list_set_render_targets(kinc_g5_command_list_t *list, struc
 	scissor.offset.y = 0;
 	vkCmdSetScissor(list->impl._buffer, 0, 1, &scissor);
 
-	if (currentPipeline != NULL) {
-		currentVulkanPipeline = currentPipeline->impl.rendertarget_pipeline;
-		vkCmdBindPipeline(list->impl._buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, currentPipeline->impl.rendertarget_pipeline);
-	}
+	bind_current_pipeline(list);
 }
 
 void kinc_g5_command_list_upload_index_buffer(kinc_g5_command_list_t *list, struct kinc_g5_index_buffer *buffer) {}
@@ -761,7 +737,7 @@ void kinc_g5_command_list_get_render_target_pixels(kinc_g5_command_list_t *list,
 	}
 
 	vkCmdEndRenderPass(list->impl._buffer);
-	setImageLayout(list->impl._buffer, render_target->impl.sourceImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	setImageLayout(list->impl._buffer, render_target->impl.sourceImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL,
 	               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
 	VkBufferImageCopy region;
@@ -782,7 +758,7 @@ void kinc_g5_command_list_get_render_target_pixels(kinc_g5_command_list_t *list,
 	                       &region);
 
 	setImageLayout(list->impl._buffer, render_target->impl.sourceImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	               VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+	               VK_IMAGE_LAYOUT_GENERAL);
 	vkCmdBeginRenderPass(list->impl._buffer, &currentRenderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
 	in_render_pass = true;
 
@@ -837,7 +813,7 @@ void kinc_g5_command_list_execute(kinc_g5_command_list_t *list) {
 	// Make sure the previous execution is done, so we can reuse the fence
 	// Not optimal of course
 	VkResult err = vkWaitForFences(vk_ctx.device, 1, &list->impl.fence, VK_TRUE, UINT64_MAX);
-	assert(!err);
+	check_fence_wait(err);
 	vkResetFences(vk_ctx.device, 1, &list->impl.fence);
 
 	VkPipelineStageFlags pipe_stage_flags = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
@@ -871,12 +847,13 @@ void kinc_g5_command_list_execute(kinc_g5_command_list_t *list) {
 
 void kinc_g5_command_list_wait_for_execution_to_finish(kinc_g5_command_list_t *list) {
 	VkResult err = vkWaitForFences(vk_ctx.device, 1, &list->impl.fence, VK_TRUE, UINT64_MAX);
-	assert(!err);
+	check_fence_wait(err);
 }
 
 void kinc_g5_command_list_set_texture(kinc_g5_command_list_t *list, kinc_g5_texture_unit_t unit, kinc_g5_texture_t *texture) {
 	vulkanTextures[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = texture;
 	vulkanRenderTargets[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = NULL;
+	vulkanRenderTargetsDepth[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = false;
 }
 
 void kinc_g5_command_list_set_sampler(kinc_g5_command_list_t *list, kinc_g5_texture_unit_t unit, kinc_g5_sampler_t *sampler) {
@@ -890,7 +867,14 @@ void kinc_g5_command_list_set_image_texture(kinc_g5_command_list_t *list, kinc_g
 	vulkanRenderTargets[unit.stages[KINC_G5_SHADER_TYPE_COMPUTE]] = NULL;
 }
 
-void kinc_g5_command_list_set_render_target_face(kinc_g5_command_list_t *list, kinc_g5_render_target_t *texture, int face) {}
+void kinc_g5_command_list_set_render_target_face(kinc_g5_command_list_t *list, kinc_g5_render_target_t *texture, int face) {
+	if (!texture->impl.is_cube || face < 0 || face >= 6) {
+		return;
+	}
+	texture->impl.current_face = face;
+	kinc_g5_render_target_t *targets[1] = {texture};
+	kinc_g5_command_list_set_render_targets(list, targets, 1);
+}
 
 bool kinc_g5_command_list_init_occlusion_query(kinc_g5_command_list_t *list, unsigned *occlusionQuery) {
 	return false;
@@ -909,12 +893,14 @@ void kinc_g5_command_list_get_query_result(kinc_g5_command_list_t *list, unsigne
 void kinc_g5_command_list_set_texture_from_render_target(kinc_g5_command_list_t *list, kinc_g5_texture_unit_t unit, kinc_g5_render_target_t *target) {
 	target->impl.stage = unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT];
 	vulkanRenderTargets[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = target;
+	vulkanRenderTargetsDepth[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = false;
 	vulkanTextures[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = NULL;
 }
 
 void kinc_g5_command_list_set_texture_from_render_target_depth(kinc_g5_command_list_t *list, kinc_g5_texture_unit_t unit, kinc_g5_render_target_t *target) {
 	target->impl.stage_depth = unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT];
 	vulkanRenderTargets[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = target;
+	vulkanRenderTargetsDepth[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = true;
 	vulkanTextures[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = NULL;
 }
 

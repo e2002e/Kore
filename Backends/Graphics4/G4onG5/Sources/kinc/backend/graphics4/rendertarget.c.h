@@ -3,8 +3,77 @@
 #include <kinc/graphics4/rendertarget.h>
 #include <kinc/graphics5/commandlist.h>
 #include <kinc/log.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 extern kinc_g5_command_list_t commandList;
+
+// Debug aid: with KINC_DUMP_FRAME=<n> set, kinc_g4_end reads back every offscreen render target
+// at the end of frame n and writes them as raw files (see kinc_g4_on_g5_internal_debug_dump).
+static kinc_g4_render_target_t *debug_render_targets[256];
+static int debug_render_target_count = 0;
+
+static void kinc_g4_on_g5_internal_debug_register_render_target(kinc_g4_render_target_t *target) {
+	if (debug_render_target_count < 256) {
+		debug_render_targets[debug_render_target_count++] = target;
+	}
+}
+
+static void kinc_g4_on_g5_internal_debug_unregister_render_target(kinc_g4_render_target_t *target) {
+	for (int i = 0; i < debug_render_target_count; ++i) {
+		if (debug_render_targets[i] == target) {
+			debug_render_targets[i] = debug_render_targets[--debug_render_target_count];
+			return;
+		}
+	}
+}
+
+void kinc_g4_on_g5_internal_debug_dump(void) {
+#ifdef KINC_VULKAN
+	static int frame = 0;
+	static int dump_frame = -2;
+	if (dump_frame == -2) {
+		const char *env = getenv("KINC_DUMP_FRAME");
+		dump_frame = env != NULL ? atoi(env) : -1;
+	}
+	if (frame++ != dump_frame) {
+		return;
+	}
+	const char *dir = getenv("KINC_DUMP_DIR");
+	for (int i = 0; i < debug_render_target_count; ++i) {
+		kinc_g5_render_target_t *rt = &debug_render_targets[i]->impl._renderTarget;
+		int bytes_per_pixel = 4;
+		switch (rt->impl.format) {
+		case VK_FORMAT_R32G32B32A32_SFLOAT:
+			bytes_per_pixel = 16;
+			break;
+		case VK_FORMAT_R16G16B16A16_SFLOAT:
+			bytes_per_pixel = 8;
+			break;
+		case VK_FORMAT_R16_SFLOAT:
+			bytes_per_pixel = 2;
+			break;
+		case VK_FORMAT_R8_UNORM:
+			bytes_per_pixel = 1;
+			break;
+		default:
+			break;
+		}
+		uint8_t *data = (uint8_t *)malloc((size_t)rt->width * rt->height * bytes_per_pixel);
+		kinc_g5_command_list_get_render_target_pixels(&commandList, rt, data);
+		char path[512];
+		snprintf(path, sizeof(path), "%s/rt%02d_%dx%d_vkfmt%d.raw", dir != NULL ? dir : ".", i, rt->width, rt->height, (int)rt->impl.format);
+		FILE *file = fopen(path, "wb");
+		if (file != NULL) {
+			fwrite(data, 1, (size_t)rt->width * rt->height * bytes_per_pixel, file);
+			fclose(file);
+		}
+		free(data);
+	}
+	kinc_log(KINC_LOG_LEVEL_INFO, "Dumped %d render targets of frame %d", debug_render_target_count, dump_frame);
+#endif
+}
+
 
 void kinc_g4_render_target_init_with_multisampling(kinc_g4_render_target_t *render_target, int width, int height, kinc_g4_render_target_format_t format,
                                                    int depthBufferBits, int stencilBufferBits, int samples_per_pixel) {
@@ -13,6 +82,7 @@ void kinc_g4_render_target_init_with_multisampling(kinc_g4_render_target_t *rend
 	render_target->texWidth = render_target->width = width;
 	render_target->texHeight = render_target->height = height;
 	render_target->impl.state = KINC_INTERNAL_RENDER_TARGET_STATE_RENDER_TARGET;
+	kinc_g4_on_g5_internal_debug_register_render_target(render_target);
 }
 
 void kinc_g4_render_target_init_cube_with_multisampling(kinc_g4_render_target_t *render_target, int cubeMapSize, kinc_g4_render_target_format_t format,
@@ -22,6 +92,7 @@ void kinc_g4_render_target_init_cube_with_multisampling(kinc_g4_render_target_t 
 }
 
 void kinc_g4_render_target_destroy(kinc_g4_render_target_t *render_target) {
+	kinc_g4_on_g5_internal_debug_unregister_render_target(render_target);
 	kinc_g5_render_target_destroy(&render_target->impl._renderTarget);
 }
 

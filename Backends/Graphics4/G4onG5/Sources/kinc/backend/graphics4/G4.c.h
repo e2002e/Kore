@@ -405,7 +405,10 @@ void kinc_g4_disable_scissor(void) {
 	kinc_g5_command_list_disable_scissor(&commandList);
 }
 
+void kinc_g4_on_g5_internal_debug_dump(void);
+
 void kinc_g4_end(int window) {
+	kinc_g4_on_g5_internal_debug_dump();
 	kinc_g5_constant_buffer_unlock(&vertexConstantBuffer);
 	kinc_g5_constant_buffer_unlock(&fragmentConstantBuffer);
 	kinc_g5_constant_buffer_unlock(&computeConstantBuffer);
@@ -675,6 +678,9 @@ void kinc_g4_set_render_targets(kinc_g4_render_target_t **targets, int count) {
 }
 
 void kinc_g4_set_render_target_face(kinc_g4_render_target_t *texture, int face) {
+	// Keep the G4 state in sync: clears and post-flush restores use the current target
+	windows[current_window].current_render_targets[0] = texture;
+	windows[current_window].current_render_target_count = 1;
 	kinc_g5_command_list_set_render_target_face(&commandList, &texture->impl._renderTarget, face);
 	current_state.viewport_set = false;
 	current_state.scissor_set = false;
