@@ -40,6 +40,62 @@ kinc_g5_texture_t *vulkanTextures[16] = {NULL, NULL, NULL, NULL, NULL, NULL, NUL
 kinc_g5_render_target_t *vulkanRenderTargets[16] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
 // Per slot: sample the render target's depth instead of its color
 bool vulkanRenderTargetsDepth[16] = {false};
+
+// Interop for code outside Kore that talks to Vulkan directly (e.g. NVIDIA NGX/DLSS in armorcore).
+#define KINC_VK_MAX_EXTERNAL_EXTENSIONS 32
+static const char *external_instance_extensions[KINC_VK_MAX_EXTERNAL_EXTENSIONS];
+static int external_instance_extension_count = 0;
+static const char *external_device_extensions[KINC_VK_MAX_EXTERNAL_EXTENSIONS];
+static int external_device_extension_count = 0;
+
+static void request_extensions(const char **list, int *count, const char **extensions, int extension_count) {
+	for (int i = 0; i < extension_count && *count < KINC_VK_MAX_EXTERNAL_EXTENSIONS; ++i) {
+		list[(*count)++] = strdup(extensions[i]);
+	}
+}
+
+// Call before kinc_init: extensions are enabled when available (missing ones are skipped)
+void kinc_vulkan_request_instance_extensions(const char **extensions, int count) {
+	request_extensions(external_instance_extensions, &external_instance_extension_count, extensions, count);
+}
+
+void kinc_vulkan_request_device_extensions(const char **extensions, int count) {
+	request_extensions(external_device_extensions, &external_device_extension_count, extensions, count);
+}
+
+static void add_external_instance_extensions(const char **wanted, int *wanted_count) {
+	uint32_t available_count = 0;
+	vkEnumerateInstanceExtensionProperties(NULL, &available_count, NULL);
+	VkExtensionProperties *available = (VkExtensionProperties *)malloc(sizeof(VkExtensionProperties) * available_count);
+	vkEnumerateInstanceExtensionProperties(NULL, &available_count, available);
+	for (int i = 0; i < external_instance_extension_count; ++i) {
+		bool found = false;
+		for (uint32_t j = 0; j < available_count; ++j) {
+			if (strcmp(external_instance_extensions[i], available[j].extensionName) == 0) {
+				found = true;
+				break;
+			}
+		}
+		bool duplicate = false;
+		for (int j = 0; j < *wanted_count; ++j) {
+			if (strcmp(external_instance_extensions[i], wanted[j]) == 0) {
+				duplicate = true;
+				break;
+			}
+		}
+		if (found && !duplicate) {
+			wanted[(*wanted_count)++] = external_instance_extensions[i];
+		}
+	}
+	free(available);
+}
+
+void kinc_vulkan_get_handles(VkInstance *instance, VkPhysicalDevice *physical_device, VkDevice *device, VkQueue *queue) {
+	*instance = vk_ctx.instance;
+	*physical_device = vk_ctx.gpu;
+	*device = vk_ctx.device;
+	*queue = vk_ctx.queue;
+}
 // Per slot: the bound sampler's variants without / with depth comparison
 VkSampler vulkanSamplersPlain[16] = {VK_NULL_HANDLE};
 VkSampler vulkanSamplersCompare[16] = {VK_NULL_HANDLE};
@@ -643,7 +699,7 @@ void kinc_g5_internal_init() {
 		free(instance_layers);
 	}
 
-	static const char *wanted_instance_extensions[64];
+	static const char *wanted_instance_extensions[64 + KINC_VK_MAX_EXTERNAL_EXTENSIONS];
 	int wanted_instance_extension_count = 0;
 
 	uint32_t instance_extension_count = 0;
@@ -651,6 +707,7 @@ void kinc_g5_internal_init() {
 	wanted_instance_extensions[wanted_instance_extension_count++] = VK_KHR_SURFACE_EXTENSION_NAME;
 	wanted_instance_extensions[wanted_instance_extension_count++] = VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
 	kinc_vulkan_get_instance_extensions(wanted_instance_extensions, &wanted_instance_extension_count, ARRAY_SIZE(wanted_instance_extensions));
+	add_external_instance_extensions(wanted_instance_extensions, &wanted_instance_extension_count);
 
 	err = vkEnumerateInstanceExtensionProperties(NULL, &instance_extension_count, NULL);
 	assert(!err);
@@ -681,7 +738,8 @@ void kinc_g5_internal_init() {
 #ifdef KINC_VKRT
 	app.apiVersion = VK_API_VERSION_1_2;
 #else
-	app.apiVersion = VK_API_VERSION_1_0;
+	// External users (e.g. NVIDIA NGX/DLSS) need a newer core version
+	app.apiVersion = external_device_extension_count > 0 || external_instance_extension_count > 0 ? VK_API_VERSION_1_2 : VK_API_VERSION_1_0;
 #endif
 
 	VkInstanceCreateInfo info = {0};
@@ -834,7 +892,7 @@ void kinc_g5_internal_init() {
 		free(device_layers);
 	}
 
-	const char *wanted_device_extensions[64];
+	const char *wanted_device_extensions[64 + KINC_VK_MAX_EXTERNAL_EXTENSIONS];
 	int wanted_device_extension_count = 0;
 
 	wanted_device_extensions[wanted_device_extension_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
@@ -865,6 +923,36 @@ void kinc_g5_internal_init() {
 	VkExtensionProperties *device_extensions = (VkExtensionProperties *)malloc(sizeof(VkExtensionProperties) * device_extension_count);
 	err = vkEnumerateDeviceExtensionProperties(vk_ctx.gpu, NULL, &device_extension_count, device_extensions);
 	assert(!err);
+
+	// Optional extensions requested by external users, only those the device has (checked below
+	// with the required ones, so they go before VK_KHR_format_feature_flags2 stays last)
+	{
+		const char *format_flags2 = wanted_device_extensions[wanted_device_extension_count - 1];
+		wanted_device_extension_count -= 1;
+		for (int i = 0; i < external_device_extension_count; ++i) {
+			bool available = false;
+			for (uint32_t j = 0; j < device_extension_count; ++j) {
+				if (strcmp(external_device_extensions[i], device_extensions[j].extensionName) == 0) {
+					available = true;
+					break;
+				}
+			}
+			bool duplicate = false;
+			for (int j = 0; j < wanted_device_extension_count; ++j) {
+				if (strcmp(external_device_extensions[i], wanted_device_extensions[j]) == 0) {
+					duplicate = true;
+					break;
+				}
+			}
+			if (available && !duplicate) {
+				wanted_device_extensions[wanted_device_extension_count++] = external_device_extensions[i];
+			}
+			else if (!available) {
+				kinc_log(KINC_LOG_LEVEL_INFO, "Optional Vulkan device extension %s not available", external_device_extensions[i]);
+			}
+		}
+		wanted_device_extensions[wanted_device_extension_count++] = format_flags2;
+	}
 
 	bool missing_device_extensions = check_extensions(wanted_device_extensions, wanted_device_extension_count, device_extensions, device_extension_count);
 	if (missing_device_extensions) {

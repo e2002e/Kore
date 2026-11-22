@@ -130,6 +130,10 @@ static void render_target_init(kinc_g5_render_target_t *target, int width, int h
 			image.samples = VK_SAMPLE_COUNT_1_BIT;
 			image.tiling = VK_IMAGE_TILING_OPTIMAL;
 			image.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+			// Storage too when the format allows: external compute (e.g. DLSS output) writes render targets
+			if (formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+				image.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+			}
 			image.flags = 0;
 
 			VkImageViewCreateInfo colorImageView = {0};
@@ -414,4 +418,19 @@ void kinc_g5_render_target_set_depth_stencil_from(kinc_g5_render_target_t *targe
 	target->impl.depth_format = source->impl.depth_format;
 	// The source owns the depth image; framebuffers pick up the new view via the cache key
 	target->impl.depth_borrowed = true;
+}
+
+// For external Vulkan users (e.g. DLSS): the render target's color (or depth) image, view and format,
+// always in VK_IMAGE_LAYOUT_GENERAL
+void kinc_vulkan_render_target_get_image(kinc_g5_render_target_t *target, bool depth, VkImage *image, VkImageView *view, VkFormat *format) {
+	if (depth || target->impl.depth_only) {
+		*image = target->impl.depthImage;
+		*view = target->impl.depthView;
+		*format = target->impl.depth_format;
+	}
+	else {
+		*image = target->impl.sourceImage;
+		*view = target->impl.sourceView;
+		*format = target->impl.format;
+	}
 }

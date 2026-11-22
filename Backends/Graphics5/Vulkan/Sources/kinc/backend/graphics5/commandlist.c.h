@@ -435,6 +435,49 @@ void kinc_vulkan_internal_clear_color_image(VkImage image, VkClearColorValue val
 	}
 }
 
+// External command recording (e.g. NGX/DLSS): returns the frame's command buffer outside of any render
+// pass, with earlier work made visible; NULL when no frame is being recorded. Pair with end.
+static bool external_resume_pass = false;
+
+VkCommandBuffer kinc_vulkan_begin_external_commands(void) {
+	if (recording_list == NULL) {
+		return VK_NULL_HANDLE;
+	}
+	VkCommandBuffer buffer = recording_list->impl._buffer;
+	external_resume_pass = in_render_pass;
+	if (in_render_pass) {
+		vkCmdEndRenderPass(buffer);
+		in_render_pass = false;
+	}
+	VkMemoryBarrier barrier = {0};
+	barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+	vkCmdPipelineBarrier(buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+	return buffer;
+}
+
+void kinc_vulkan_end_external_commands(void) {
+	if (recording_list == NULL) {
+		return;
+	}
+	VkCommandBuffer buffer = recording_list->impl._buffer;
+	VkMemoryBarrier barrier = {0};
+	barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+	vkCmdPipelineBarrier(buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+	// External code may have bound its own pipelines and descriptor sets
+	if (external_resume_pass) {
+		vkCmdBeginRenderPass(buffer, &currentRenderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+		in_render_pass = true;
+		external_resume_pass = false;
+	}
+	if (currentPipeline != NULL) {
+		bind_current_pipeline(recording_list);
+	}
+}
+
 void kinc_g5_command_list_end(kinc_g5_command_list_t *list) {
 	vkCmdEndRenderPass(list->impl._buffer);
 
