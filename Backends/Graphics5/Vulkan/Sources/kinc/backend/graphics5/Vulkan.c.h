@@ -944,7 +944,10 @@ void kinc_g5_internal_init() {
 					break;
 				}
 			}
-			if (available && !duplicate) {
+			// Promoted to core in Vulkan 1.2 (enabled as a 1.2 feature below); enabling both is invalid
+			bool promoted = strcmp(external_device_extensions[i], "VK_EXT_buffer_device_address") == 0 ||
+			                strcmp(external_device_extensions[i], "VK_KHR_buffer_device_address") == 0;
+			if (available && !duplicate && !promoted) {
 				wanted_device_extensions[wanted_device_extension_count++] = external_device_extensions[i];
 			}
 			else if (!available) {
@@ -1095,6 +1098,26 @@ void kinc_g5_internal_init() {
 			enabled_features.depthClamp = supported_features.depthClamp;
 			enabled_features.shaderImageGatherExtended = supported_features.shaderImageGatherExtended;
 			deviceinfo.pEnabledFeatures = &enabled_features;
+
+#ifndef KINC_VKRT
+			// External users (e.g. NGX/DLSS) allocate with buffer device addresses (Vulkan 1.2 core)
+			VkPhysicalDeviceVulkan12Features vulkan12_features = {0};
+			vulkan12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+			if (external_device_extension_count > 0 || external_instance_extension_count > 0) {
+				VkPhysicalDeviceVulkan12Features supported12 = {0};
+				supported12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+				VkPhysicalDeviceFeatures2 features2 = {0};
+				features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+				features2.pNext = &supported12;
+				vkGetPhysicalDeviceFeatures2(vk_ctx.gpu, &features2);
+				vulkan12_features.bufferDeviceAddress = supported12.bufferDeviceAddress;
+				vulkan12_features.timelineSemaphore = supported12.timelineSemaphore;
+				vulkan12_features.descriptorIndexing = supported12.descriptorIndexing;
+				vulkan12_features.shaderSampledImageArrayNonUniformIndexing = supported12.shaderSampledImageArrayNonUniformIndexing;
+				vulkan12_features.runtimeDescriptorArray = supported12.runtimeDescriptorArray;
+				deviceinfo.pNext = &vulkan12_features;
+			}
+#endif
 
 #ifdef KINC_VKRT
 			VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineExt = {0};
@@ -1337,7 +1360,9 @@ bool kinc_g5_supports_non_pow2_textures() {
 }
 
 bool kinc_g5_render_targets_inverted_y() {
-	return false;
+	// Offscreen targets are rendered without the y-flip, so their memory layout matches OpenGL's
+	// (row 0 = bottom): report inverted like the GL backend so 2D code draws into them the same way
+	return true;
 }
 
 int kinc_g5_max_bound_textures(void) {
