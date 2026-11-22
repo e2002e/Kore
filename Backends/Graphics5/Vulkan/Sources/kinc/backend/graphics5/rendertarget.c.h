@@ -100,9 +100,17 @@ static void render_target_init(kinc_g5_render_target_t *target, int width, int h
 	target->impl.depth_borrowed = false;
 	target->impl.is_cube = false;
 	target->impl.current_face = 0;
+	target->impl.depth_only = framebuffer_index < 0 && format == KINC_G5_RENDER_TARGET_FORMAT_16BIT_DEPTH;
+	if (target->impl.depth_only) {
+		target->impl.format = KINC_VK_RENDER_TARGET_DEPTH_FORMAT;
+		if (depthBufferBits <= 0) {
+			target->impl.depthBufferBits = depthBufferBits = 16;
+		}
+	}
+	target->impl.depth_format = target->impl.depth_only ? KINC_VK_RENDER_TARGET_DEPTH_FORMAT : kinc_vulkan_depth_format(depthBufferBits);
 
 	if (framebuffer_index < 0) {
-		{
+		if (!target->impl.depth_only) {
 			VkFormatProperties formatProperties;
 			VkResult err;
 
@@ -167,7 +175,7 @@ static void render_target_init(kinc_g5_render_target_t *target, int width, int h
 		}
 
 		if (depthBufferBits > 0) {
-			const VkFormat depth_format = KINC_VK_RENDER_TARGET_DEPTH_FORMAT;
+			const VkFormat depth_format = target->impl.depth_format;
 			VkImageCreateInfo image = {0};
 			image.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 			image.pNext = NULL;
@@ -233,6 +241,11 @@ static void render_target_init(kinc_g5_render_target_t *target, int width, int h
 			assert(!err);
 		}
 
+		if (target->impl.depth_only) {
+			target->impl.sourceImage = VK_NULL_HANDLE;
+			target->impl.sourceMemory = VK_NULL_HANDLE;
+			target->impl.sourceView = target->impl.depthView;
+		}
 		// Framebuffers are created on demand per render pass (get_rt_framebuffer)
 		target->impl.framebuffer = VK_NULL_HANDLE;
 	}
@@ -331,12 +344,28 @@ void kinc_g5_render_target_init_cube_with_multisampling(kinc_g5_render_target_t 
 	target->impl.stage_depth = -1;
 	target->impl.is_cube = true;
 	target->impl.current_face = 0;
+	target->impl.depth_only = format == KINC_G5_RENDER_TARGET_FORMAT_16BIT_DEPTH;
+	if (target->impl.depth_only) {
+		target->impl.format = KINC_VK_RENDER_TARGET_DEPTH_FORMAT;
+		if (depthBufferBits <= 0) {
+			target->impl.depthBufferBits = depthBufferBits = 16;
+		}
+		target->impl.depth_format = KINC_VK_RENDER_TARGET_DEPTH_FORMAT;
+		create_cube_image(KINC_VK_RENDER_TARGET_DEPTH_FORMAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		                  VK_IMAGE_ASPECT_DEPTH_BIT, cubeMapSize, &target->impl.depthImage, &target->impl.depthMemory, &target->impl.depthView,
+		                  target->impl.face_depth_views);
+		target->impl.sourceView = target->impl.depthView;
+		memcpy(target->impl.face_views, target->impl.face_depth_views, sizeof(target->impl.face_views));
+		target->impl.framebuffer = VK_NULL_HANDLE;
+		return;
+	}
 
 	create_cube_image(target->impl.format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 	                  VK_IMAGE_ASPECT_COLOR_BIT, cubeMapSize, &target->impl.sourceImage, &target->impl.sourceMemory, &target->impl.sourceView,
 	                  target->impl.face_views);
+	target->impl.depth_format = kinc_vulkan_depth_format(depthBufferBits);
 	if (depthBufferBits > 0) {
-		create_cube_image(KINC_VK_RENDER_TARGET_DEPTH_FORMAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		create_cube_image(target->impl.depth_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 		                  VK_IMAGE_ASPECT_DEPTH_BIT, cubeMapSize, &target->impl.depthImage, &target->impl.depthMemory, &target->impl.depthView,
 		                  target->impl.face_depth_views);
 	}
@@ -353,8 +382,10 @@ void kinc_g5_render_target_destroy(kinc_g5_render_target_t *target) {
 		release_rt_framebuffers_using(target->impl.sourceView);
 		if (target->impl.is_cube) {
 			for (int face = 0; face < 6; ++face) {
-				release_rt_framebuffers_using(target->impl.face_views[face]);
-				vkDestroyImageView(vk_ctx.device, target->impl.face_views[face], NULL);
+				if (!target->impl.depth_only) {
+					release_rt_framebuffers_using(target->impl.face_views[face]);
+					vkDestroyImageView(vk_ctx.device, target->impl.face_views[face], NULL);
+				}
 				if (target->impl.depthBufferBits > 0) {
 					release_rt_framebuffers_using(target->impl.face_depth_views[face]);
 					vkDestroyImageView(vk_ctx.device, target->impl.face_depth_views[face], NULL);
@@ -367,9 +398,11 @@ void kinc_g5_render_target_destroy(kinc_g5_render_target_t *target) {
 			vkDestroyImage(vk_ctx.device, target->impl.depthImage, NULL);
 			vkFreeMemory(vk_ctx.device, target->impl.depthMemory, NULL);
 		}
-		vkDestroyImageView(vk_ctx.device, target->impl.sourceView, NULL);
-		vkDestroyImage(vk_ctx.device, target->impl.sourceImage, NULL);
-		vkFreeMemory(vk_ctx.device, target->impl.sourceMemory, NULL);
+		if (!target->impl.depth_only) {
+			vkDestroyImageView(vk_ctx.device, target->impl.sourceView, NULL);
+			vkDestroyImage(vk_ctx.device, target->impl.sourceImage, NULL);
+			vkFreeMemory(vk_ctx.device, target->impl.sourceMemory, NULL);
+		}
 	}
 }
 
@@ -378,6 +411,7 @@ void kinc_g5_render_target_set_depth_stencil_from(kinc_g5_render_target_t *targe
 	target->impl.depthMemory = source->impl.depthMemory;
 	target->impl.depthView = source->impl.depthView;
 	target->impl.depthBufferBits = source->impl.depthBufferBits;
+	target->impl.depth_format = source->impl.depth_format;
 	// The source owns the depth image; framebuffers pick up the new view via the cache key
 	target->impl.depth_borrowed = true;
 }

@@ -40,6 +40,9 @@ kinc_g5_texture_t *vulkanTextures[16] = {NULL, NULL, NULL, NULL, NULL, NULL, NUL
 kinc_g5_render_target_t *vulkanRenderTargets[16] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
 // Per slot: sample the render target's depth instead of its color
 bool vulkanRenderTargetsDepth[16] = {false};
+// Per slot: the bound sampler's variants without / with depth comparison
+VkSampler vulkanSamplersPlain[16] = {VK_NULL_HANDLE};
+VkSampler vulkanSamplersCompare[16] = {VK_NULL_HANDLE};
 VkSampler vulkanSamplers[16] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
                                 VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
 

@@ -8,6 +8,14 @@ void kinc_g5_shader_init(kinc_g5_shader_t *shader, const void *source, size_t le
 		shader->impl.source[i] = ((char *)source)[i];
 	}
 	shader->impl.source[length] = 0;
+
+	size_t fixed_length = 0;
+	uint32_t *fixed = kinc_vulkan_fix_uniform_layout((const uint32_t *)shader->impl.source, length, &fixed_length);
+	if (fixed != NULL) {
+		free(shader->impl.source);
+		shader->impl.source = (char *)fixed;
+		shader->impl.length = (int)fixed_length;
+	}
 }
 
 void kinc_g5_shader_destroy(kinc_g5_shader_t *shader) {

@@ -36,6 +36,9 @@ typedef struct PipelineState5Impl_s {
 	kinc_internal_named_number fragmentOffsets[KINC_INTERNAL_NAMED_NUMBER_COUNT];
 
 	VkPipelineLayout pipeline_layout;
+
+	// Image type per sampler slot (enum kinc_vk_texture_kind), for dummies in unbound slots
+	uint8_t texture_kinds[16];
 } PipelineState5Impl;
 
 typedef struct ComputePipelineState5Impl_t {

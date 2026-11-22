@@ -65,6 +65,12 @@ static void create_compute_descriptor_layout(void) {
 }
 
 void kinc_g5_compute_shader_init(kinc_g5_compute_shader *shader, void *_data, int length) {
+	size_t fixed_length = 0;
+	uint32_t *fixed = kinc_vulkan_fix_uniform_layout((const uint32_t *)_data, (size_t)length, &fixed_length);
+	if (fixed != NULL) {
+		_data = fixed;
+		length = (int)fixed_length;
+	}
 	memset(shader->impl.locations, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
 	memset(shader->impl.offsets, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
 	memset(shader->impl.texture_bindings, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
@@ -173,6 +179,7 @@ void kinc_g5_compute_shader_init(kinc_g5_compute_shader *shader, void *_data, in
 	    kinc_log(KINC_LOG_LEVEL_WARNING, "Could not initialize compute shader.");
 	    return;
 	}*/
+	free(fixed);
 }
 
 void kinc_g5_compute_shader_destroy(kinc_g5_compute_shader *shader) {

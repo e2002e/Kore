@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <stdlib.h>
 #include "G4.h"
 #include "kinc/graphics4/graphics.h"
 #include "kinc/window.h"
@@ -658,7 +660,10 @@ void kinc_g4_restore_render_target(void) {
 	current_state.scissor_set = false;
 }
 
+void kinc_g4_on_g5_internal_debug_set_target(void);
+
 void kinc_g4_set_render_targets(kinc_g4_render_target_t **targets, int count) {
+	kinc_g4_on_g5_internal_debug_set_target();
 	for (int i = 0; i < count; ++i) {
 		windows[current_window].current_render_targets[i] = targets[i];
 		if (windows[current_window].current_render_targets[i]->impl.state != KINC_INTERNAL_RENDER_TARGET_STATE_RENDER_TARGET) {

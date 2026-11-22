@@ -4,7 +4,9 @@
 #include <kinc/image.h>
 #include <kinc/log.h>
 
-bool use_staging_buffer = false;
+// Sample from optimally tiled images: linear tiling often lacks linear filtering (e.g. for float
+// formats), which makes sampling results undefined
+bool use_staging_buffer = true;
 
 bool memory_type_from_properties(uint32_t typeBits, VkFlags requirements_mask, uint32_t *typeIndex);
 void set_image_layout(VkImage image, VkImageAspectFlags aspectMask, VkImageLayout old_image_layout, VkImageLayout new_image_layout);
@@ -93,7 +95,7 @@ static void prepare_texture_image(uint8_t *tex_colors, uint32_t tex_width, uint3
 			uint16_t *tex_colors16 = (uint16_t *)tex_colors;
 			for (uint32_t y = 0; y < tex_height; y++) {
 				for (uint32_t x = 0; x < tex_width; x++) {
-					data16[y * (layout.rowPitch / 4) + x] = tex_colors16[y * tex_width + x];
+					data16[y * (layout.rowPitch / 2) + x] = tex_colors16[y * tex_width + x];
 				}
 			}
 		}
@@ -114,10 +116,10 @@ static void prepare_texture_image(uint8_t *tex_colors, uint32_t tex_width, uint3
 			uint16_t *tex_colors16 = (uint16_t *)tex_colors;
 			for (uint32_t y = 0; y < tex_height; y++) {
 				for (uint32_t x = 0; x < tex_width; x++) {
-					data16[y * (layout.rowPitch / 4) + x * 4 + 0] = tex_colors16[y * tex_width * 4 + x * 4 + 0];
-					data16[y * (layout.rowPitch / 4) + x * 4 + 1] = tex_colors16[y * tex_width * 4 + x * 4 + 1];
-					data16[y * (layout.rowPitch / 4) + x * 4 + 2] = tex_colors16[y * tex_width * 4 + x * 4 + 2];
-					data16[y * (layout.rowPitch / 4) + x * 4 + 3] = tex_colors16[y * tex_width * 4 + x * 4 + 3];
+					data16[y * (layout.rowPitch / 2) + x * 4 + 0] = tex_colors16[y * tex_width * 4 + x * 4 + 0];
+					data16[y * (layout.rowPitch / 2) + x * 4 + 1] = tex_colors16[y * tex_width * 4 + x * 4 + 1];
+					data16[y * (layout.rowPitch / 2) + x * 4 + 2] = tex_colors16[y * tex_width * 4 + x * 4 + 2];
+					data16[y * (layout.rowPitch / 2) + x * 4 + 3] = tex_colors16[y * tex_width * 4 + x * 4 + 3];
 				}
 			}
 		}
@@ -155,7 +157,9 @@ static void prepare_texture_image(uint8_t *tex_colors, uint32_t tex_width, uint3
 	else {
 		tex_obj->imageLayout = VK_IMAGE_LAYOUT_GENERAL; // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 	}
-	set_image_layout(tex_obj->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, tex_obj->imageLayout);
+	// The image was created PREINITIALIZED and may hold host-written texels: transitioning from
+	// UNDEFINED would allow the driver to discard them
+	set_image_layout(tex_obj->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_PREINITIALIZED, tex_obj->imageLayout);
 	// setting the image layout does not reference the actual memory so no need to add a mem ref
 }
 

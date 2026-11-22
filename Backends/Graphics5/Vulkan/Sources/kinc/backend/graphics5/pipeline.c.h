@@ -9,6 +9,8 @@
 VkDescriptorSetLayout desc_layout;
 extern kinc_g5_texture_t *vulkanTextures[16];
 extern kinc_g5_render_target_t *vulkanRenderTargets[16];
+extern VkSampler vulkanSamplersPlain[16];
+extern VkSampler vulkanSamplersCompare[16];
 extern bool vulkanRenderTargetsDepth[16];
 extern uint32_t swapchainImageCount;
 extern uint32_t current_buffer;
@@ -125,8 +127,54 @@ static void add_offset(uint32_t id, uint32_t offset) {
 	++offsets_size;
 }
 
+// Image type of each sampler binding found by the last parse_shader call (enum kinc_vk_texture_kind
+// is in rtcache.c.h), for picking a matching dummy texture for unbound slots
+typedef struct {
+	uint32_t binding;
+	uint8_t kind;
+} parsed_texture_kind;
+static parsed_texture_kind parsed_texture_kinds[32];
+static int parsed_texture_kinds_count = 0;
+
+typedef struct {
+	uint16_t op;
+	uint32_t a, b, c;
+} spv_id_info;
+
+static uint8_t resolve_texture_kind(spv_id_info *ids, uint32_t bound, uint32_t variable) {
+	if (variable >= bound || ids[variable].op != 59) { // OpVariable
+		return KINC_VK_TEXTURE_KIND_UNKNOWN;
+	}
+	uint32_t t = ids[variable].a;
+	if (t < bound && ids[t].op == 32) { // OpTypePointer
+		t = ids[t].a;
+	}
+	if (t < bound && ids[t].op == 28) { // OpTypeArray
+		t = ids[t].a;
+	}
+	if (t < bound && ids[t].op == 27) { // OpTypeSampledImage
+		t = ids[t].a;
+	}
+	if (t >= bound || ids[t].op != 25) { // OpTypeImage
+		return KINC_VK_TEXTURE_KIND_UNKNOWN;
+	}
+	uint32_t dim = ids[t].a;
+	bool depth = ids[t].b == 1;
+	switch (dim) {
+	case 1: // 2D
+		return depth ? KINC_VK_TEXTURE_KIND_2D_DEPTH : KINC_VK_TEXTURE_KIND_2D;
+	case 2: // 3D
+		return KINC_VK_TEXTURE_KIND_3D;
+	case 3: // Cube
+		return depth ? KINC_VK_TEXTURE_KIND_CUBE_DEPTH : KINC_VK_TEXTURE_KIND_CUBE;
+	default:
+		return KINC_VK_TEXTURE_KIND_UNKNOWN;
+	}
+}
+
 static void parse_shader(uint32_t *shader_source, int shader_length, kinc_internal_named_number *locations, kinc_internal_named_number *textureBindings,
                          kinc_internal_named_number *uniformOffsets) {
+	parsed_texture_kinds_count = 0;
 	names_size = 0;
 	memberNames_size = 0;
 	locs_size = 0;
@@ -142,6 +190,8 @@ static void parse_shader(uint32_t *shader_source, int shader_length, kinc_intern
 	uint32_t generator = spirv[index++];
 	uint32_t bound = spirv[index++];
 	index++;
+
+	spv_id_info *ids = (spv_id_info *)calloc(bound, sizeof(spv_id_info));
 
 	while (index < spirvsize) {
 		int wordCount = spirv[index] >> 16;
@@ -167,6 +217,33 @@ static void parse_shader(uint32_t *shader_source, int shader_length, kinc_intern
 			}
 			break;
 		}
+		case 25: // OpTypeImage: result, sampled type, dim, depth, arrayed, ...
+			if (operands[0] < bound && ids != NULL) {
+				ids[operands[0]].op = 25;
+				ids[operands[0]].a = operands[2];
+				ids[operands[0]].b = operands[3];
+				ids[operands[0]].c = operands[4];
+			}
+			break;
+		case 27: // OpTypeSampledImage: result, image type
+		case 28: // OpTypeArray: result, element type, length
+			if (operands[0] < bound && ids != NULL) {
+				ids[operands[0]].op = (uint16_t)opcode;
+				ids[operands[0]].a = operands[1];
+			}
+			break;
+		case 32: // OpTypePointer: result, storage class, type
+			if (operands[0] < bound && ids != NULL) {
+				ids[operands[0]].op = 32;
+				ids[operands[0]].a = operands[2];
+			}
+			break;
+		case 59: // OpVariable: result type, result, storage class
+			if (operands[1] < bound && ids != NULL) {
+				ids[operands[1]].op = 59;
+				ids[operands[1]].a = operands[0];
+			}
+			break;
 		case 71: { // OpDecorate
 			uint32_t id = operands[0];
 			uint32_t decoration = operands[1];
@@ -210,7 +287,13 @@ static void parse_shader(uint32_t *shader_source, int shader_length, kinc_intern
 		if (name != NULL) {
 			set_number(textureBindings, name, bindings[i].value);
 		}
+		if (ids != NULL && parsed_texture_kinds_count < 32) {
+			parsed_texture_kinds[parsed_texture_kinds_count].binding = bindings[i].value;
+			parsed_texture_kinds[parsed_texture_kinds_count].kind = resolve_texture_kind(ids, bound, bindings[i].id);
+			parsed_texture_kinds_count++;
+		}
 	}
+	free(ids);
 
 	for (uint32_t i = 0; i < offsets_size; ++i) {
 		char *name = find_member_name(offsets[i].id);
@@ -297,7 +380,18 @@ kinc_g5_constant_location_t kinc_g5_pipeline_get_constant_location(kinc_g5_pipel
 
 kinc_g5_texture_unit_t kinc_g5_pipeline_get_texture_unit(kinc_g5_pipeline_t *pipeline, const char *name) {
 	kinc_g5_texture_unit_t unit;
-	int number = find_number(pipeline->impl.textureBindings, name);
+	// Sampler arrays ("shadowMap[0]") are one binding named without the index. The descriptor layout
+	// has one descriptor per binding, so only element 0 can be bound for now.
+	char base_name[64];
+	const char *bracket = strchr(name, '[');
+	int array_index = 0;
+	if (bracket != NULL && (size_t)(bracket - name) < sizeof(base_name)) {
+		memcpy(base_name, name, bracket - name);
+		base_name[bracket - name] = 0;
+		array_index = atoi(bracket + 1);
+		name = base_name;
+	}
+	int number = array_index == 0 ? (int)find_number(pipeline->impl.textureBindings, name) : -1;
 	assert(number == -1 || number >= 2); // something wrong with the SPIR-V when this triggers
 
 	for (int i = 0; i < KINC_G5_SHADER_TYPE_COUNT; ++i) {
@@ -475,16 +569,28 @@ static VkFormat convert_vertex_format(kinc_g4_vertex_data_t data) {
 	}
 }
 
+static void record_texture_kinds(kinc_g5_pipeline_t *pipeline) {
+	for (int i = 0; i < parsed_texture_kinds_count; ++i) {
+		uint32_t binding = parsed_texture_kinds[i].binding;
+		if (binding >= 2 && binding < 18 && parsed_texture_kinds[i].kind != KINC_VK_TEXTURE_KIND_UNKNOWN) {
+			pipeline->impl.texture_kinds[binding - 2] = parsed_texture_kinds[i].kind;
+		}
+	}
+}
+
 void kinc_g5_pipeline_compile(kinc_g5_pipeline_t *pipeline) {
 	memset(pipeline->impl.vertexLocations, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
 	memset(pipeline->impl.vertexOffsets, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
 	memset(pipeline->impl.fragmentLocations, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
 	memset(pipeline->impl.fragmentOffsets, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
 	memset(pipeline->impl.textureBindings, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
+	memset(pipeline->impl.texture_kinds, 0, sizeof(pipeline->impl.texture_kinds));
 	parse_shader((uint32_t *)pipeline->vertexShader->impl.source, pipeline->vertexShader->impl.length, pipeline->impl.vertexLocations,
 	             pipeline->impl.textureBindings, pipeline->impl.vertexOffsets);
+	record_texture_kinds(pipeline);
 	parse_shader((uint32_t *)pipeline->fragmentShader->impl.source, pipeline->fragmentShader->impl.length, pipeline->impl.fragmentLocations,
 	             pipeline->impl.textureBindings, pipeline->impl.fragmentOffsets);
+	record_texture_kinds(pipeline);
 
 	VkPipelineLayoutCreateInfo pPipelineLayoutCreateInfo = {0};
 	pPipelineLayoutCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -769,7 +875,6 @@ static int descriptor_sets_count = 0;
 
 static int write_tex_descs(VkDescriptorImageInfo *tex_descs) {
 	memset(tex_descs, 0, sizeof(VkDescriptorImageInfo) * 16);
-	ensure_dummy_texture();
 
 	int texture_count = 0;
 	for (int i = 0; i < 16; ++i) {
@@ -788,12 +893,23 @@ static int write_tex_descs(VkDescriptorImageInfo *tex_descs) {
 			}
 			texture_count++;
 		}
-		// Every slot gets written: unbound or incomplete ones sample a 1x1 (0,0,0,1) texture, like GL
+		// Every slot gets written: unbound ones sample a 1x1 dummy of the type the shader declares
+		// ((0,0,0,1) color like an unbound GL unit, depth 1.0 = unshadowed for shadow samplers)
 		if (tex_descs[i].imageView == VK_NULL_HANDLE) {
-			tex_descs[i].imageView = dummy_texture_view;
+			int kind = currentPipeline != NULL ? currentPipeline->impl.texture_kinds[i] : KINC_VK_TEXTURE_KIND_2D;
+			kinc_vk_dummy *dummy = get_dummy_texture(kind);
+			tex_descs[i].imageView = dummy->view;
+			tex_descs[i].sampler = dummy->sampler;
+		}
+		else if (currentPipeline != NULL && vulkanSamplersPlain[i] != VK_NULL_HANDLE) {
+			// Shadow samplers need depth comparison, everything else must not have it (G4onG5 keeps
+			// compare mode as per-slot state, so it would otherwise leak onto later textures)
+			int kind = currentPipeline->impl.texture_kinds[i];
+			bool shadow = kind == KINC_VK_TEXTURE_KIND_2D_DEPTH || kind == KINC_VK_TEXTURE_KIND_CUBE_DEPTH;
+			tex_descs[i].sampler = shadow ? vulkanSamplersCompare[i] : vulkanSamplersPlain[i];
 		}
 		if (tex_descs[i].sampler == VK_NULL_HANDLE) {
-			tex_descs[i].sampler = dummy_sampler;
+			tex_descs[i].sampler = get_dummy_texture(KINC_VK_TEXTURE_KIND_2D)->sampler;
 		}
 		tex_descs[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 	}

@@ -11,6 +11,12 @@
 
 #define KINC_VK_RENDER_TARGET_DEPTH_FORMAT VK_FORMAT_D16_UNORM
 
+// Depth format for a render target: GL backends give >16 bits 24-bit depth; with only 16 bits,
+// geometry near the far plane (e.g. Armory's skydome) quantizes to 1.0 and fails LESS tests.
+static VkFormat kinc_vulkan_depth_format(int depth_bits) {
+	return depth_bits > 16 ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D16_UNORM;
+}
+
 void setup_init_cmd();
 void flush_init_cmd();
 void setImageLayout(VkCommandBuffer _buffer, VkImage image, VkImageAspectFlags aspectMask, VkImageLayout oldImageLayout, VkImageLayout newImageLayout);
@@ -18,7 +24,7 @@ void setImageLayout(VkCommandBuffer _buffer, VkImage image, VkImageAspectFlags a
 typedef struct {
 	int color_count;
 	VkFormat formats[8];
-	bool depth;
+	VkFormat depth; // VK_FORMAT_UNDEFINED: no depth attachment
 	VkRenderPass pass;
 } rt_render_pass_entry;
 
@@ -26,7 +32,7 @@ static rt_render_pass_entry *rt_render_passes = NULL;
 static int rt_render_pass_count = 0;
 static int rt_render_pass_capacity = 0;
 
-static VkRenderPass get_rt_render_pass(const VkFormat *formats, int color_count, bool depth) {
+static VkRenderPass get_rt_render_pass(const VkFormat *formats, int color_count, VkFormat depth) {
 	for (int i = 0; i < rt_render_pass_count; ++i) {
 		rt_render_pass_entry *entry = &rt_render_passes[i];
 		if (entry->color_count == color_count && entry->depth == depth && memcmp(entry->formats, formats, sizeof(VkFormat) * color_count) == 0) {
@@ -52,7 +58,7 @@ static VkRenderPass get_rt_render_pass(const VkFormat *formats, int color_count,
 
 	VkAttachmentReference depth_reference = {0};
 	if (depth) {
-		attachments[color_count].format = KINC_VK_RENDER_TARGET_DEPTH_FORMAT;
+		attachments[color_count].format = depth;
 		attachments[color_count].samples = VK_SAMPLE_COUNT_1_BIT;
 		attachments[color_count].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
 		attachments[color_count].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -197,71 +203,122 @@ static void release_rt_framebuffers_using(VkImageView view) {
 	rt_framebuffer_count = kept;
 }
 
-// 1x1 (0,0,0,1) texture + sampler bound to sampler slots nothing was assigned to, like an unbound
-// GL texture unit. Vulkan requires every statically used descriptor to be valid.
-static VkImage dummy_texture_image = VK_NULL_HANDLE;
-static VkDeviceMemory dummy_texture_memory = VK_NULL_HANDLE;
-static VkImageView dummy_texture_view = VK_NULL_HANDLE;
-static VkSampler dummy_sampler = VK_NULL_HANDLE;
+enum kinc_vk_texture_kind {
+	KINC_VK_TEXTURE_KIND_UNKNOWN = 0,
+	KINC_VK_TEXTURE_KIND_2D,
+	KINC_VK_TEXTURE_KIND_2D_DEPTH,
+	KINC_VK_TEXTURE_KIND_CUBE,
+	KINC_VK_TEXTURE_KIND_CUBE_DEPTH,
+	KINC_VK_TEXTURE_KIND_3D,
+	KINC_VK_TEXTURE_KIND_COUNT
+};
 
-static void ensure_dummy_texture(void) {
-	if (dummy_texture_view != VK_NULL_HANDLE) {
-		return;
+// 1x1 dummies bound to sampler slots nothing was assigned to, one per image type the shader may
+// declare (Vulkan requires every statically used descriptor to be valid and of the right type).
+// Color ones read (0,0,0,1) like an unbound GL texture unit; depth ones hold 1.0 and come with a
+// compare sampler, so shadow lookups read "lit".
+typedef struct {
+	VkImage image;
+	VkDeviceMemory memory;
+	VkImageView view;
+	VkSampler sampler;
+} kinc_vk_dummy;
+
+static kinc_vk_dummy dummy_textures[KINC_VK_TEXTURE_KIND_COUNT];
+
+static kinc_vk_dummy *get_dummy_texture(int kind) {
+	if (kind <= KINC_VK_TEXTURE_KIND_UNKNOWN || kind >= KINC_VK_TEXTURE_KIND_COUNT) {
+		kind = KINC_VK_TEXTURE_KIND_2D;
 	}
+	kinc_vk_dummy *dummy = &dummy_textures[kind];
+	if (dummy->view != VK_NULL_HANDLE) {
+		return dummy;
+	}
+
+	bool depth = kind == KINC_VK_TEXTURE_KIND_2D_DEPTH || kind == KINC_VK_TEXTURE_KIND_CUBE_DEPTH;
+	bool cube = kind == KINC_VK_TEXTURE_KIND_CUBE || kind == KINC_VK_TEXTURE_KIND_CUBE_DEPTH;
+	bool volume = kind == KINC_VK_TEXTURE_KIND_3D;
+	VkFormat format = depth ? KINC_VK_RENDER_TARGET_DEPTH_FORMAT : VK_FORMAT_R8G8B8A8_UNORM;
+	VkImageAspectFlags aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+	uint32_t layers = cube ? 6 : 1;
 
 	VkImageCreateInfo image = {0};
 	image.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-	image.imageType = VK_IMAGE_TYPE_2D;
-	image.format = VK_FORMAT_R8G8B8A8_UNORM;
+	image.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+	image.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+	image.format = format;
 	image.extent.width = 1;
 	image.extent.height = 1;
 	image.extent.depth = 1;
 	image.mipLevels = 1;
-	image.arrayLayers = 1;
+	image.arrayLayers = layers;
 	image.samples = VK_SAMPLE_COUNT_1_BIT;
 	image.tiling = VK_IMAGE_TILING_OPTIMAL;
 	image.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-	VkResult err = vkCreateImage(vk_ctx.device, &image, NULL, &dummy_texture_image);
+	VkResult err = vkCreateImage(vk_ctx.device, &image, NULL, &dummy->image);
 	assert(!err);
 
 	VkMemoryRequirements reqs;
-	vkGetImageMemoryRequirements(vk_ctx.device, dummy_texture_image, &reqs);
+	vkGetImageMemoryRequirements(vk_ctx.device, dummy->image, &reqs);
 	VkMemoryAllocateInfo alloc = {0};
 	alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
 	alloc.allocationSize = reqs.size;
 	bool pass = memory_type_from_properties(reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &alloc.memoryTypeIndex);
 	assert(pass);
-	err = vkAllocateMemory(vk_ctx.device, &alloc, NULL, &dummy_texture_memory);
+	err = vkAllocateMemory(vk_ctx.device, &alloc, NULL, &dummy->memory);
 	assert(!err);
-	err = vkBindImageMemory(vk_ctx.device, dummy_texture_image, dummy_texture_memory, 0);
+	err = vkBindImageMemory(vk_ctx.device, dummy->image, dummy->memory, 0);
 	assert(!err);
 
+	VkImageSubresourceRange range = {aspect, 0, 1, 0, layers};
+	VkImageMemoryBarrier barrier = {0};
+	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image = dummy->image;
+	barrier.subresourceRange = range;
+
 	setup_init_cmd();
-	setImageLayout(vk_ctx.setup_cmd, dummy_texture_image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-	VkClearColorValue black = {{0.0f, 0.0f, 0.0f, 1.0f}};
-	VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-	vkCmdClearColorImage(vk_ctx.setup_cmd, dummy_texture_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
-	setImageLayout(vk_ctx.setup_cmd, dummy_texture_image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+	barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	vkCmdPipelineBarrier(vk_ctx.setup_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+	if (depth) {
+		VkClearDepthStencilValue one = {1.0f, 0};
+		vkCmdClearDepthStencilImage(vk_ctx.setup_cmd, dummy->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &one, 1, &range);
+	}
+	else {
+		VkClearColorValue black = {{0.0f, 0.0f, 0.0f, 1.0f}};
+		vkCmdClearColorImage(vk_ctx.setup_cmd, dummy->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+	}
+	barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(vk_ctx.setup_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
 	flush_init_cmd();
 
 	VkImageViewCreateInfo view = {0};
 	view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-	view.image = dummy_texture_image;
-	view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-	view.format = VK_FORMAT_R8G8B8A8_UNORM;
+	view.image = dummy->image;
+	view.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : (volume ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D);
+	view.format = format;
 	view.subresourceRange = range;
-	err = vkCreateImageView(vk_ctx.device, &view, NULL, &dummy_texture_view);
+	err = vkCreateImageView(vk_ctx.device, &view, NULL, &dummy->view);
 	assert(!err);
 
 	VkSamplerCreateInfo sampler = {0};
 	sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-	sampler.magFilter = VK_FILTER_LINEAR;
-	sampler.minFilter = VK_FILTER_LINEAR;
+	sampler.magFilter = VK_FILTER_NEAREST;
+	sampler.minFilter = VK_FILTER_NEAREST;
 	sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
 	sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
 	sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
 	sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sampler.compareEnable = depth ? VK_TRUE : VK_FALSE;
+	sampler.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 	sampler.maxLod = 0.0f;
-	err = vkCreateSampler(vk_ctx.device, &sampler, NULL, &dummy_sampler);
+	err = vkCreateSampler(vk_ctx.device, &sampler, NULL, &dummy->sampler);
 	assert(!err);
+	return dummy;
 }

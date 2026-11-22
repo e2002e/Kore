@@ -71,8 +71,18 @@ void kinc_g5_sampler_init(kinc_g5_sampler_t *sampler, const kinc_g5_sampler_opti
 	info.minLod = options->lod_min_clamp;
 
 	vkCreateSampler(vk_ctx.device, &info, NULL, &sampler->impl.sampler);
+
+	info.compareEnable = VK_FALSE;
+	vkCreateSampler(vk_ctx.device, &info, NULL, &sampler->impl.sampler_plain);
+	info.compareEnable = VK_TRUE;
+	if (!options->is_comparison) {
+		info.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL; // GL's default compare func
+	}
+	vkCreateSampler(vk_ctx.device, &info, NULL, &sampler->impl.sampler_compare);
 }
 
 void kinc_g5_sampler_destroy(kinc_g5_sampler_t *sampler) {
 	vkDestroySampler(vk_ctx.device, sampler->impl.sampler, NULL);
+	vkDestroySampler(vk_ctx.device, sampler->impl.sampler_plain, NULL);
+	vkDestroySampler(vk_ctx.device, sampler->impl.sampler_compare, NULL);
 }

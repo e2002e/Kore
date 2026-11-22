@@ -12,6 +12,8 @@
 
 extern kinc_g5_texture_t *vulkanTextures[16];
 extern kinc_g5_render_target_t *vulkanRenderTargets[16];
+extern VkSampler vulkanSamplersPlain[16];
+extern VkSampler vulkanSamplersCompare[16];
 extern bool vulkanRenderTargetsDepth[16];
 VkDescriptorSet getDescriptorSet(void);
 static VkDescriptorSet get_compute_descriptor_set(void);
@@ -170,6 +172,13 @@ void set_image_layout(VkImage image, VkImageAspectFlags aspectMask, VkImageLayou
 
 	if (old_image_layout != VK_IMAGE_LAYOUT_UNDEFINED) {
 		image_memory_barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+	}
+	if (old_image_layout == VK_IMAGE_LAYOUT_PREINITIALIZED) {
+		// Host writes done before the submit are made visible by the submit itself
+		image_memory_barrier.srcAccessMask = 0;
+	}
+	if (new_image_layout == VK_IMAGE_LAYOUT_GENERAL) {
+		image_memory_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
 	}
 
 	if (new_image_layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) {
@@ -655,25 +664,31 @@ void kinc_g5_command_list_set_render_targets(kinc_g5_command_list_t *list, struc
 	rp_begin.clearValueCount = count + 1;
 	rp_begin.pClearValues = clear_values;
 
+	// Depth-only targets contribute no color attachment
 	VkFormat formats[8];
 	VkImageView views[9];
+	int color_count = 0;
 	for (int i = 0; i < count; ++i) {
-		formats[i] = targets[i]->impl.format;
-		views[i] = targets[i]->impl.is_cube ? targets[i]->impl.face_views[targets[i]->impl.current_face] : targets[i]->impl.sourceView;
+		if (targets[i]->impl.depth_only) {
+			continue;
+		}
+		formats[color_count] = targets[i]->impl.format;
+		views[color_count] = targets[i]->impl.is_cube ? targets[i]->impl.face_views[targets[i]->impl.current_face] : targets[i]->impl.sourceView;
+		color_count++;
 	}
 	bool depth = targets[0]->impl.depthBufferBits > 0;
 	if (depth) {
-		views[count] = targets[0]->impl.is_cube ? targets[0]->impl.face_depth_views[targets[0]->impl.current_face] : targets[0]->impl.depthView;
+		views[color_count] = targets[0]->impl.is_cube ? targets[0]->impl.face_depth_views[targets[0]->impl.current_face] : targets[0]->impl.depthView;
 	}
 	current_pass_has_depth = depth;
-	rp_begin.renderPass = get_rt_render_pass(formats, count, depth);
-	rp_begin.framebuffer = get_rt_framebuffer(rp_begin.renderPass, views, depth ? count + 1 : count, targets[0]->width, targets[0]->height);
+	rp_begin.renderPass = get_rt_render_pass(formats, color_count, depth ? targets[0]->impl.depth_format : VK_FORMAT_UNDEFINED);
+	rp_begin.framebuffer = get_rt_framebuffer(rp_begin.renderPass, views, depth ? color_count + 1 : color_count, targets[0]->width, targets[0]->height);
 
 	vkCmdBeginRenderPass(list->impl._buffer, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 	currentRenderPassBeginInfo = rp_begin;
 	in_render_pass = true;
 	current_render_pass = rp_begin.renderPass;
-	current_color_count = count;
+	current_color_count = color_count;
 
 	// Offscreen targets are not y-flipped: with a positive viewport their memory layout matches GL
 	// (row 0 = NDC y -1 = texture v 0), so sampling and gl_FragCoord behave as on GL. Only the back
@@ -706,6 +721,10 @@ void kinc_g5_command_list_upload_vertex_buffer(kinc_g5_command_list_t *list, str
 void kinc_g5_command_list_upload_texture(kinc_g5_command_list_t *list, struct kinc_g5_texture *texture) {}
 
 void kinc_g5_command_list_get_render_target_pixels(kinc_g5_command_list_t *list, kinc_g5_render_target_t *render_target, uint8_t *data) {
+	if (render_target->impl.depth_only || render_target->impl.is_cube) {
+		kinc_log(KINC_LOG_LEVEL_WARNING, "Reading back depth-only or cube render targets is not supported on Vulkan.");
+		return;
+	}
 	VkFormat format = render_target->impl.format;
 	int formatByteSize = formatSize(format);
 
@@ -859,6 +878,8 @@ void kinc_g5_command_list_set_texture(kinc_g5_command_list_t *list, kinc_g5_text
 void kinc_g5_command_list_set_sampler(kinc_g5_command_list_t *list, kinc_g5_texture_unit_t unit, kinc_g5_sampler_t *sampler) {
 	if (unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT] >= 0) {
 		vulkanSamplers[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = sampler->impl.sampler;
+		vulkanSamplersPlain[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = sampler->impl.sampler_plain;
+		vulkanSamplersCompare[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = sampler->impl.sampler_compare;
 	}
 }
 
