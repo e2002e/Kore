@@ -227,6 +227,7 @@ static void update_stride(kinc_g5_texture_t *texture) {
 }
 
 void kinc_g5_texture_init_from_image(kinc_g5_texture_t *texture, kinc_image_t *image) {
+	memset(&texture->impl, 0, sizeof(texture->impl));
 	texture->texWidth = image->width;
 	texture->texHeight = image->height;
 
@@ -310,6 +311,7 @@ void kinc_g5_texture_init_from_image(kinc_g5_texture_t *texture, kinc_image_t *i
 }
 
 void kinc_g5_texture_init(kinc_g5_texture_t *texture, int width, int height, kinc_image_format_t format) {
+	memset(&texture->impl, 0, sizeof(texture->impl));
 	texture->texWidth = width;
 	texture->texHeight = height;
 
@@ -350,9 +352,86 @@ void kinc_g5_texture_init(kinc_g5_texture_t *texture, int width, int height, kin
 	assert(!err);
 }
 
-void kinc_g5_texture_init3d(kinc_g5_texture_t *texture, int width, int height, int depth, kinc_image_format_t format) {}
+void kinc_g5_texture_init3d(kinc_g5_texture_t *texture, int width, int height, int depth, kinc_image_format_t format) {
+	memset(&texture->impl, 0, sizeof(texture->impl));
+	texture->texWidth = width;
+	texture->texHeight = height;
+	texture->impl.depth = depth;
+	texture->impl.is_3d = true;
+
+	const VkFormat tex_format = convert_image_format(format);
+	texture->impl.format = tex_format;
+
+	VkFormatProperties props;
+	vkGetPhysicalDeviceFormatProperties(vk_ctx.gpu, tex_format, &props);
+
+	// Volumes are used as sampled textures and as image load/store targets (voxel GI), and get cleared
+	VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+		usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+	}
+	// GL lets an r32f texture be bound as an r32ui image (atomics); Vulkan needs a mutable image and a uint view
+	bool uint_alias = tex_format == VK_FORMAT_R32_SFLOAT;
+
+	VkImageCreateInfo image = {0};
+	image.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	image.flags = uint_alias ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+	image.imageType = VK_IMAGE_TYPE_3D;
+	image.format = tex_format;
+	image.extent.width = width;
+	image.extent.height = height;
+	image.extent.depth = depth;
+	image.mipLevels = 1;
+	image.arrayLayers = 1;
+	image.samples = VK_SAMPLE_COUNT_1_BIT;
+	image.tiling = VK_IMAGE_TILING_OPTIMAL;
+	image.usage = usage;
+	image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	VkResult err = vkCreateImage(vk_ctx.device, &image, NULL, &texture->impl.texture.image);
+	assert(!err);
+
+	VkMemoryRequirements reqs;
+	vkGetImageMemoryRequirements(vk_ctx.device, texture->impl.texture.image, &reqs);
+	VkMemoryAllocateInfo alloc = {0};
+	alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	alloc.allocationSize = reqs.size;
+	bool pass = memory_type_from_properties(reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &alloc.memoryTypeIndex);
+	assert(pass);
+	err = vkAllocateMemory(vk_ctx.device, &alloc, NULL, &texture->impl.texture.mem);
+	assert(!err);
+	err = vkBindImageMemory(vk_ctx.device, texture->impl.texture.image, texture->impl.texture.mem, 0);
+	assert(!err);
+	texture->impl.deviceSize = reqs.size;
+	texture->impl.texture.tex_width = width;
+	texture->impl.texture.tex_height = height;
+	texture->impl.texture.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+	// Vulkan memory is not zeroed: start from black like a fresh GL texture
+	VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	set_image_layout(texture->impl.texture.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+	VkClearColorValue zero = {{0.0f, 0.0f, 0.0f, 0.0f}};
+	vkCmdClearColorImage(vk_ctx.setup_cmd, texture->impl.texture.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+	flush_init_cmd();
+
+	VkImageViewCreateInfo view = {0};
+	view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	view.image = texture->impl.texture.image;
+	view.viewType = VK_IMAGE_VIEW_TYPE_3D;
+	view.format = tex_format;
+	view.subresourceRange = range;
+	err = vkCreateImageView(vk_ctx.device, &view, NULL, &texture->impl.texture.view);
+	assert(!err);
+
+	if (uint_alias) {
+		view.format = VK_FORMAT_R32_UINT;
+		err = vkCreateImageView(vk_ctx.device, &view, NULL, &texture->impl.uint_view);
+		assert(!err);
+	}
+	texture->impl.stride = width * format_byte_size(format);
+}
 
 void kinc_g5_texture_init_non_sampled_access(kinc_g5_texture_t *texture, int width, int height, kinc_image_format_t format) {
+	memset(&texture->impl, 0, sizeof(texture->impl));
 	texture->texWidth = width;
 	texture->texHeight = height;
 
@@ -394,6 +473,9 @@ void kinc_g5_texture_init_non_sampled_access(kinc_g5_texture_t *texture, int wid
 }
 
 void kinc_g5_texture_destroy(kinc_g5_texture_t *texture) {
+	if (texture->impl.uint_view != VK_NULL_HANDLE) {
+		vkDestroyImageView(vk_ctx.device, texture->impl.uint_view, NULL);
+	}
 	vkDestroyImageView(vk_ctx.device, texture->impl.texture.view, NULL);
 	destroy_texture_image(&texture->impl.texture);
 }
@@ -417,7 +499,15 @@ void kinc_g5_texture_unlock(kinc_g5_texture_t *texture) {
 	vkUnmapMemory(vk_ctx.device, texture->impl.texture.mem);
 }
 
-void kinc_g5_texture_clear(kinc_g5_texture_t *texture, int x, int y, int z, int width, int height, int depth, unsigned color) {}
+void kinc_g5_texture_clear(kinc_g5_texture_t *texture, int x, int y, int z, int width, int height, int depth, unsigned color) {
+	// vkCmdClearColorImage clears whole subresources; G4 users clear whole textures in practice
+	VkClearColorValue value;
+	value.float32[0] = ((color >> 16) & 0xff) / 255.0f;
+	value.float32[1] = ((color >> 8) & 0xff) / 255.0f;
+	value.float32[2] = (color & 0xff) / 255.0f;
+	value.float32[3] = ((color >> 24) & 0xff) / 255.0f;
+	kinc_vulkan_internal_clear_color_image(texture->impl.texture.image, value);
+}
 
 void kinc_g5_texture_generate_mipmaps(kinc_g5_texture_t *texture, int levels) {}
 

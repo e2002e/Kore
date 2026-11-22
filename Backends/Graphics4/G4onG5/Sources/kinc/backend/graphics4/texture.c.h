@@ -25,7 +25,14 @@ void kinc_g4_texture_init(kinc_g4_texture_t *texture, int width, int height, kin
 	texture->format = format;
 }
 
-void kinc_g4_texture_init3d(kinc_g4_texture_t *texture, int width, int height, int depth, kinc_image_format_t format) {}
+void kinc_g4_texture_init3d(kinc_g4_texture_t *texture, int width, int height, int depth, kinc_image_format_t format) {
+	texture->impl._uploaded = true;
+	kinc_g5_texture_init3d(&texture->impl._texture, width, height, depth, format);
+	texture->tex_width = width;
+	texture->tex_height = height;
+	texture->tex_depth = depth;
+	texture->format = format;
+}
 
 void kinc_g4_texture_init_from_bytes(kinc_g4_texture_t *texture, void *data, int size, const char *format) {}
 

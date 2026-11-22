@@ -83,6 +83,7 @@ static int current_color_count = 1;
 static bool current_pass_has_depth = false;
 
 static bool in_render_pass = false;
+static kinc_g5_command_list_t *recording_list = NULL; // list between begin and end, for texture clears
 
 // Asserts are compiled out in release builds; a lost device would otherwise go unnoticed and every
 // later wait would "succeed" immediately.
@@ -336,6 +337,7 @@ void kinc_g5_command_list_begin(kinc_g5_command_list_t *list) {
 	check_fence_wait(err);
 
 	flush_pipeline_releases();
+	recording_list = list;
 
 	vkResetCommandBuffer(list->impl._buffer, 0);
 	VkCommandBufferBeginInfo cmd_buf_info = {0};
@@ -399,6 +401,38 @@ void kinc_g5_command_list_begin(kinc_g5_command_list_t *list) {
 	set_viewport_and_scissor(list);
 
 	onBackBuffer = true;
+}
+
+// Clears a whole color image (kept in GENERAL layout) in frame order: clears are not allowed inside a
+// render pass, so the active pass is ended and resumed (its attachments use LOAD, except the swapchain
+// pass, which should not be active while textures are cleared).
+void kinc_vulkan_internal_clear_color_image(VkImage image, VkClearColorValue value) {
+	VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	if (recording_list == NULL) {
+		setup_init_cmd();
+		vkCmdClearColorImage(vk_ctx.setup_cmd, image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+		flush_init_cmd();
+		return;
+	}
+	VkCommandBuffer buffer = recording_list->impl._buffer;
+	bool resume = in_render_pass;
+	if (in_render_pass) {
+		vkCmdEndRenderPass(buffer);
+		in_render_pass = false;
+	}
+	VkMemoryBarrier barrier = {0};
+	barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	vkCmdPipelineBarrier(buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+	vkCmdClearColorImage(buffer, image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+	barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	vkCmdPipelineBarrier(buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+	if (resume) {
+		vkCmdBeginRenderPass(buffer, &currentRenderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+		in_render_pass = true;
+	}
 }
 
 void kinc_g5_command_list_end(kinc_g5_command_list_t *list) {

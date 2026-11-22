@@ -17,4 +17,9 @@ typedef struct {
 
 	uint8_t *conversionBuffer;
 	int stride;
+
+	int depth;               // > 1 or is_3d for 3D textures
+	bool is_3d;
+	VkFormat format;
+	VkImageView uint_view;   // R32_UINT view of 32-bit single-channel images (GL-style r32ui image access), else VK_NULL_HANDLE
 } Texture5Impl;
