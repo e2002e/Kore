@@ -1062,6 +1062,16 @@ void kinc_g5_command_list_compute(kinc_g5_command_list_t *list, int x, int y, in
 		in_render_pass = false;
 	}
 
+	// Everything recorded before (draws writing storage images, e.g. voxelization into the back buffer
+	// pass whose dependencies don't cover shader writes, attachments, clears) must be visible here
+	{
+		VkMemoryBarrier before = {0};
+		before.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		before.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+		                       VK_ACCESS_TRANSFER_WRITE_BIT;
+		before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		vkCmdPipelineBarrier(list->impl._buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &before, 0, NULL, 0, NULL);
+	}
 	vkCmdDispatch(list->impl._buffer, x, y, z);
 
 	// Image writes of this dispatch must be visible to later dispatches, draws and copies
