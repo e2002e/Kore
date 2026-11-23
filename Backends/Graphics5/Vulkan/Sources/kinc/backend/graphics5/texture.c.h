@@ -434,6 +434,7 @@ void kinc_g5_texture_init3d(kinc_g5_texture_t *texture, int width, int height, i
 		assert(!err);
 	}
 	texture->impl.stride = width * format_byte_size(format);
+	kinc_vulkan_debug_register_3d(texture);
 }
 
 void kinc_g5_texture_init_non_sampled_access(kinc_g5_texture_t *texture, int width, int height, kinc_image_format_t format) {
@@ -479,6 +480,7 @@ void kinc_g5_texture_init_non_sampled_access(kinc_g5_texture_t *texture, int wid
 }
 
 void kinc_g5_texture_destroy(kinc_g5_texture_t *texture) {
+	kinc_vulkan_debug_unregister_3d(texture);
 	kinc_vk_forget_image_view(texture->impl.texture.view);
 	kinc_vk_forget_image_view(texture->impl.uint_view);
 	if (texture->impl.uint_view != VK_NULL_HANDLE) {

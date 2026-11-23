@@ -28,15 +28,19 @@ static void kinc_g4_on_g5_internal_debug_unregister_render_target(kinc_g4_render
 	}
 }
 
+#ifdef KINC_VULKAN
+void kinc_vulkan_debug_dump_3d(kinc_g5_command_list_t *list, const char *dir);
+#endif
+
 static int debug_frame = 0;
 static int debug_set_target_calls = 0;
 
 static void debug_dump_now(int frame, int call) {
 #ifdef KINC_VULKAN
 	const char *dir = getenv("KINC_DUMP_DIR");
-	for (int i = 0; i < debug_render_target_count; ++i) {
+	for (int i = 0; i < (getenv("KINC_DUMP_ONLY_3D") != NULL ? 0 : debug_render_target_count); ++i) {
 		kinc_g5_render_target_t *rt = &debug_render_targets[i]->impl._renderTarget;
-		if (rt->impl.depth_only || rt->impl.is_cube) {
+		if (rt->impl.depth_only || rt->impl.is_cube || (getenv("KINC_DUMP_3D") != NULL && rt->width * rt->height > 4096 * 4096)) {
 			continue;
 		}
 		int bytes_per_pixel = 4;
@@ -67,6 +71,9 @@ static void debug_dump_now(int frame, int call) {
 		}
 		free(data);
 	}
+	if (getenv("KINC_DUMP_3D") != NULL) {
+		kinc_vulkan_debug_dump_3d(&commandList, dir);
+	}
 	kinc_log(KINC_LOG_LEVEL_INFO, "Dumped %d render targets of frame %d (call %d)", debug_render_target_count, frame, call);
 #endif
 }
@@ -82,7 +89,19 @@ void kinc_g4_on_g5_internal_debug_dump(void) {
 	if (dump_frame == -2) {
 		dump_frame = debug_env_int("KINC_DUMP_FRAME");
 	}
-	if (debug_frame == dump_frame && debug_env_int("KINC_DUMP_CALL") < 0) {
+	// KINC_DUMP_REPEAT=k: also dump every k frames after KINC_DUMP_FRAME (KINC_DUMP_COUNT dumps, default 2),
+	// each into <KINC_DUMP_DIR>/f<frame> (must exist), to compare frames of one run
+	int repeat = debug_env_int("KINC_DUMP_REPEAT");
+	if (repeat > 0 && dump_frame >= 0 && debug_frame >= dump_frame && (debug_frame - dump_frame) % repeat == 0 &&
+	    (debug_frame - dump_frame) / repeat < (debug_env_int("KINC_DUMP_COUNT") > 0 ? debug_env_int("KINC_DUMP_COUNT") : 2)) {
+		const char *base = getenv("KINC_DUMP_DIR");
+		char dir[400];
+		snprintf(dir, sizeof(dir), "%s/f%d", base != NULL ? base : ".", debug_frame);
+		setenv("KINC_DUMP_DIR", dir, 1);
+		debug_dump_now(debug_frame, -1);
+		setenv("KINC_DUMP_DIR", base != NULL ? base : ".", 1);
+	}
+	else if (repeat <= 0 && debug_frame == dump_frame && debug_env_int("KINC_DUMP_CALL") < 0) {
 		debug_dump_now(debug_frame, -1);
 	}
 	debug_frame++;

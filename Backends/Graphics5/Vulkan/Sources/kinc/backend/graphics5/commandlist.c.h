@@ -876,6 +876,84 @@ void kinc_g5_command_list_get_render_target_pixels(kinc_g5_command_list_t *list,
 	vkUnmapMemory(vk_ctx.device, render_target->impl.readbackMemory);
 }
 
+// Debug aid (KINC_DUMP_FRAME, see G4onG5): read back every 3D texture as a raw file
+static kinc_g5_texture_t *debug_textures_3d[64];
+static int debug_texture_3d_count = 0;
+
+static void kinc_vulkan_debug_register_3d(kinc_g5_texture_t *texture) {
+	if (debug_texture_3d_count < 64) {
+		debug_textures_3d[debug_texture_3d_count++] = texture;
+	}
+}
+
+static void kinc_vulkan_debug_unregister_3d(kinc_g5_texture_t *texture) {
+	for (int i = 0; i < debug_texture_3d_count; ++i) {
+		if (debug_textures_3d[i] == texture) {
+			debug_textures_3d[i] = debug_textures_3d[--debug_texture_3d_count];
+			return;
+		}
+	}
+}
+
+void kinc_vulkan_debug_dump_3d(kinc_g5_command_list_t *list, const char *dir) {
+	for (int i = 0; i < debug_texture_3d_count; ++i) {
+		kinc_g5_texture_t *t = debug_textures_3d[i];
+		VkDeviceSize size = (VkDeviceSize)t->texWidth * t->texHeight * t->impl.depth * formatSize(t->impl.format);
+
+		VkBufferCreateInfo buf_info = {0};
+		buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		buf_info.size = size;
+		buf_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		VkBuffer buffer;
+		vkCreateBuffer(vk_ctx.device, &buf_info, NULL, &buffer);
+		VkMemoryRequirements reqs;
+		vkGetBufferMemoryRequirements(vk_ctx.device, buffer, &reqs);
+		VkMemoryAllocateInfo alloc = {0};
+		alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		alloc.allocationSize = reqs.size;
+		memory_type_from_properties(reqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &alloc.memoryTypeIndex);
+		VkDeviceMemory memory;
+		vkAllocateMemory(vk_ctx.device, &alloc, NULL, &memory);
+		vkBindBufferMemory(vk_ctx.device, buffer, memory, 0);
+
+		if (in_render_pass) {
+			vkCmdEndRenderPass(list->impl._buffer);
+		}
+		VkMemoryBarrier barrier = {0};
+		barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		vkCmdPipelineBarrier(list->impl._buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+		VkBufferImageCopy region = {0};
+		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.imageSubresource.layerCount = 1;
+		region.imageExtent.width = (uint32_t)t->texWidth;
+		region.imageExtent.height = (uint32_t)t->texHeight;
+		region.imageExtent.depth = (uint32_t)t->impl.depth;
+		vkCmdCopyImageToBuffer(list->impl._buffer, t->impl.texture.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &region);
+		if (in_render_pass) {
+			vkCmdBeginRenderPass(list->impl._buffer, &currentRenderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+		}
+		kinc_g5_command_list_end(list);
+		kinc_g5_command_list_execute(list);
+		kinc_g5_command_list_wait_for_execution_to_finish(list);
+		kinc_g5_command_list_begin(list);
+
+		void *p;
+		vkMapMemory(vk_ctx.device, memory, 0, VK_WHOLE_SIZE, 0, &p);
+		char path[512];
+		snprintf(path, sizeof(path), "%s/tex3d%02d_%dx%dx%d_vkfmt%d.raw", dir != NULL ? dir : ".", i, t->texWidth, t->texHeight, t->impl.depth, (int)t->impl.format);
+		FILE *file = fopen(path, "wb");
+		if (file != NULL) {
+			fwrite(p, 1, (size_t)size, file);
+			fclose(file);
+		}
+		vkUnmapMemory(vk_ctx.device, memory);
+		vkDestroyBuffer(vk_ctx.device, buffer, NULL);
+		vkFreeMemory(vk_ctx.device, memory, NULL);
+	}
+}
+
 void kinc_g5_command_list_texture_to_render_target_barrier(kinc_g5_command_list_t *list, struct kinc_g5_render_target *renderTarget) {
 	// render-passes are used to transition render-targets
 }

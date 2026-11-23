@@ -1300,6 +1300,13 @@ void kinc_g5_end(int window) {
 	wait_for_relay = false;
 
 	VkResult err = vk.fpQueuePresentKHR(vk_ctx.queue, &present);
+	static int sync_frames = -1; // debug: KINC_VK_SYNC=1 serializes frames (no CPU/GPU overlap)
+	if (sync_frames < 0) {
+		sync_frames = getenv("KINC_VK_SYNC") != NULL ? 1 : 0;
+	}
+	if (sync_frames) {
+		vkDeviceWaitIdle(vk_ctx.device);
+	}
 	if (err == VK_ERROR_SURFACE_LOST_KHR) {
 		vkDeviceWaitIdle(vk_ctx.device);
 		vk_ctx.windows[window].surface_destroyed = true;

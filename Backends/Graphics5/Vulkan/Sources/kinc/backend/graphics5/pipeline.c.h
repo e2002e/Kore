@@ -328,6 +328,19 @@ static VkShaderModule create_shader_module(const void *code, size_t size) {
 	VkResult err = vkCreateShaderModule(vk_ctx.device, &moduleCreateInfo, NULL, &module);
 	assert(!err);
 
+	// Debug aid: KINC_DUMP_SPIRV=<dir> writes every module as handed to the driver
+	const char *dump_dir = getenv("KINC_DUMP_SPIRV");
+	if (dump_dir != NULL) {
+		static int dumped = 0;
+		char path[512];
+		snprintf(path, sizeof(path), "%s/module%03d.spv", dump_dir, dumped++);
+		FILE *file = fopen(path, "wb");
+		if (file != NULL) {
+			fwrite(code, 1, size, file);
+			fclose(file);
+		}
+	}
+
 	return module;
 }
 
