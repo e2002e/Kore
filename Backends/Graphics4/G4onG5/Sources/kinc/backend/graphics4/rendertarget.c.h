@@ -28,12 +28,22 @@ static void kinc_g4_on_g5_internal_debug_unregister_render_target(kinc_g4_render
 	}
 }
 
+static int debug_env_int(const char *name);
 static int debug_frame = 0;
 static int debug_set_target_calls = 0;
 
 static void debug_dump_now(int frame, int call) {
 #ifdef KINC_VULKAN
-	const char *dir = getenv("KINC_DUMP_DIR");
+	const char *base_dir = getenv("KINC_DUMP_DIR");
+	char dir_buffer[512];
+	const char *dir = base_dir;
+	if (debug_env_int("KINC_DUMP_COUNT") > 1) {
+		snprintf(dir_buffer, sizeof(dir_buffer), "%s/%d", base_dir != NULL ? base_dir : ".", frame);
+		char command[600];
+		snprintf(command, sizeof(command), "mkdir -p '%s'", dir_buffer);
+		(void)system(command);
+		dir = dir_buffer;
+	}
 	for (int i = 0; i < debug_render_target_count; ++i) {
 		kinc_g5_render_target_t *rt = &debug_render_targets[i]->impl._renderTarget;
 		if (rt->impl.depth_only || rt->impl.is_cube) {
@@ -82,7 +92,12 @@ void kinc_g4_on_g5_internal_debug_dump(void) {
 	if (dump_frame == -2) {
 		dump_frame = debug_env_int("KINC_DUMP_FRAME");
 	}
-	if (debug_frame == dump_frame && debug_env_int("KINC_DUMP_CALL") < 0) {
+	// KINC_DUMP_COUNT=n dumps n consecutive frames, each into KINC_DUMP_DIR/<frame>/
+	int dump_count = debug_env_int("KINC_DUMP_COUNT");
+	if (dump_count < 1) {
+		dump_count = 1;
+	}
+	if (dump_frame >= 0 && debug_frame >= dump_frame && debug_frame < dump_frame + dump_count && debug_env_int("KINC_DUMP_CALL") < 0) {
 		debug_dump_now(debug_frame, -1);
 	}
 	debug_frame++;
