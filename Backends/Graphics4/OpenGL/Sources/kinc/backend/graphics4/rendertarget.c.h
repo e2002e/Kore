@@ -360,29 +360,17 @@ void kinc_g4_render_target_destroy(kinc_g4_render_target_t *renderTarget) {
 }
 
 void kinc_g4_render_target_use_color_as_texture(kinc_g4_render_target_t *renderTarget, kinc_g4_texture_unit_t unit) {
-	// Bind on every stage using the unit: compute units have no fragment index (-1), which bound the
-	// target to an invalid unit and made voxel GI compute passes read garbage
-	for (int i = 0; i < KINC_G4_SHADER_TYPE_COUNT; ++i) {
-		if (unit.stages[i] >= 0) {
-			glActiveTexture(GL_TEXTURE0 + unit.stages[i]);
-			glCheckErrors();
-			glBindTexture(renderTarget->isCubeMap ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, renderTarget->impl._texture);
-			glCheckErrors();
-		}
-	}
+	glActiveTexture(GL_TEXTURE0 + unit.stages[KINC_G4_SHADER_TYPE_FRAGMENT]);
+	glCheckErrors();
+	glBindTexture(renderTarget->isCubeMap ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, renderTarget->impl._texture);
+	glCheckErrors();
 }
 
 void kinc_g4_render_target_use_depth_as_texture(kinc_g4_render_target_t *renderTarget, kinc_g4_texture_unit_t unit) {
-	// Bind on every stage using the unit: compute units have no fragment index (-1), which bound the
-	// target to an invalid unit and made voxel GI compute passes read garbage
-	for (int i = 0; i < KINC_G4_SHADER_TYPE_COUNT; ++i) {
-		if (unit.stages[i] >= 0) {
-			glActiveTexture(GL_TEXTURE0 + unit.stages[i]);
-			glCheckErrors();
-			glBindTexture(renderTarget->isCubeMap ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, renderTarget->impl._depthTexture);
-			glCheckErrors();
-		}
-	}
+	glActiveTexture(GL_TEXTURE0 + unit.stages[KINC_G4_SHADER_TYPE_FRAGMENT]);
+	glCheckErrors();
+	glBindTexture(renderTarget->isCubeMap ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, renderTarget->impl._depthTexture);
+	glCheckErrors();
 }
 
 void kinc_g4_render_target_set_depth_stencil_from(kinc_g4_render_target_t *renderTarget, kinc_g4_render_target_t *source) {
