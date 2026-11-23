@@ -91,13 +91,14 @@ static VkRenderPass get_rt_render_pass(const VkFormat *formats, int color_count,
 	dependencies[0].dstStageMask = graphics_stages;
 	dependencies[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT |
 	                                VK_ACCESS_TRANSFER_WRITE_BIT;
-	dependencies[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | attachment_access;
+	dependencies[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | attachment_access;
 
 	dependencies[1].srcSubpass = 0;
 	dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
 	dependencies[1].srcStageMask = graphics_stages;
 	dependencies[1].dstStageMask = graphics_stages | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-	dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	// Includes storage image writes from shaders (e.g. voxelization's imageAtomicAdd) for later compute passes
+	dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 	dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | attachment_access | VK_ACCESS_TRANSFER_READ_BIT;
 
 	VkRenderPassCreateInfo rp_info = {0};
