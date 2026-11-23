@@ -26,6 +26,9 @@ void kinc_g5_vertex_buffer_init(kinc_g5_vertex_buffer_t *buffer, int vertexCount
 	buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
 	buf_info.pNext = NULL;
 	buf_info.size = vertexCount * buffer->impl.myStride;
+	if (buf_info.size == 0) {
+		buf_info.size = 16; // empty meshes: zero-sized buffers are invalid in Vulkan (NVIDIA crashes on them)
+	}
 	buf_info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
 #ifdef KINC_VKRT
 	buf_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -86,7 +89,8 @@ float *kinc_g5_vertex_buffer_lock_all(kinc_g5_vertex_buffer_t *buffer) {
 
 float *kinc_g5_vertex_buffer_lock(kinc_g5_vertex_buffer_t *buffer, int start, int count) {
 	VkResult err =
-	    vkMapMemory(vk_ctx.device, buffer->impl.vertices.mem, start * buffer->impl.myStride, count * buffer->impl.myStride, 0, (void **)&buffer->impl.data);
+	    vkMapMemory(vk_ctx.device, buffer->impl.vertices.mem, start * buffer->impl.myStride, count * buffer->impl.myStride > 0 ? count * buffer->impl.myStride : VK_WHOLE_SIZE, 0,
+	                (void **)&buffer->impl.data);
 	assert(!err);
 	return buffer->impl.data;
 }

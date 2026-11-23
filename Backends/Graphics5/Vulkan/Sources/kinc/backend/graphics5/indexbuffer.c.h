@@ -20,6 +20,9 @@ void kinc_g5_index_buffer_init(kinc_g5_index_buffer_t *buffer, int indexCount, k
 	buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
 	buf_info.pNext = NULL;
 	buf_info.size = format == KINC_G5_INDEX_BUFFER_FORMAT_16BIT ? indexCount * sizeof(uint16_t) : indexCount * sizeof(uint32_t);
+	if (buf_info.size == 0) {
+		buf_info.size = 16; // empty meshes: zero-sized buffers are invalid in Vulkan
+	}
 	buf_info.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 #ifdef KINC_VKRT
 	buf_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
