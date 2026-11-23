@@ -528,11 +528,55 @@ void Kinc_G4_Internal_TextureSet(kinc_g4_texture_t *texture, kinc_g4_texture_uni
 #endif
 }
 
+#if defined(KINC_WINDOWS) || (defined(KINC_LINUX) && defined(GL_VERSION_4_4))
+// The image unit format must match the shader's layout qualifier. Integer images (e.g. layout(r32ui) used for
+// atomics on an R32F or RGBA8 texture, which GL allows as both are 32-bit) need an integer unit format; binding
+// them with the texture's float format made voxel GI sums garbage. Looks up the uniform of the current program
+// that uses this unit.
+static GLenum image_unit_format(kinc_g4_texture_t *texture, int unit) {
+	GLenum format = convertInternalFormat(texture->format);
+	if (kinc_image_format_sizeof(texture->format) != 4) {
+		return format;
+	}
+	GLint program = 0;
+	glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+	if (program == 0) {
+		return format;
+	}
+	GLint count = 0;
+	glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &count);
+	for (GLint i = 0; i < count; ++i) {
+		char name[256];
+		GLsizei length;
+		GLint size;
+		GLenum type;
+		glGetActiveUniform(program, i, sizeof(name) - 1, &length, &size, &type, name);
+		bool uint_image = type == GL_UNSIGNED_INT_IMAGE_1D || type == GL_UNSIGNED_INT_IMAGE_2D || type == GL_UNSIGNED_INT_IMAGE_3D ||
+		                  type == GL_UNSIGNED_INT_IMAGE_2D_ARRAY || type == GL_UNSIGNED_INT_IMAGE_CUBE;
+		bool int_image = type == GL_INT_IMAGE_1D || type == GL_INT_IMAGE_2D || type == GL_INT_IMAGE_3D || type == GL_INT_IMAGE_2D_ARRAY ||
+		                 type == GL_INT_IMAGE_CUBE;
+		if (!uint_image && !int_image) {
+			continue;
+		}
+		GLint location = glGetUniformLocation(program, name);
+		GLint value = -1;
+		if (location >= 0) {
+			glGetUniformiv(program, location, &value);
+		}
+		if (value == unit) {
+			return uint_image ? GL_R32UI : GL_R32I;
+		}
+	}
+	return format;
+}
+#endif
+
 void Kinc_G4_Internal_TextureImageSet(kinc_g4_texture_t *texture, kinc_g4_texture_unit_t unit) {
 #if defined(KINC_WINDOWS) || (defined(KINC_LINUX) && defined(GL_VERSION_4_4))
 	for (int i = 0; i < KINC_G4_SHADER_TYPE_COUNT; ++i) {
 		if (unit.stages[i] >= 0) {
-			glBindImageTexture(unit.stages[i], texture->impl.texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, convertInternalFormat(texture->format));
+			GLenum format = i == KINC_G4_SHADER_TYPE_COMPUTE ? image_unit_format(texture, unit.stages[i]) : convertInternalFormat(texture->format);
+			glBindImageTexture(unit.stages[i], texture->impl.texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, format);
 		}
 	}
 	glCheckErrors();

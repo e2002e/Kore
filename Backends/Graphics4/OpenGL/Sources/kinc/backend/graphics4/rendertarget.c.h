@@ -359,15 +359,23 @@ void kinc_g4_render_target_destroy(kinc_g4_render_target_t *renderTarget) {
 	glDeleteFramebuffers(1, framebuffers);
 }
 
+// Graphics units bind on their fragment index as before. Compute units have none (-1): that made
+// glActiveTexture fail and bound the target onto whatever unit was active, overwriting another texture
+// (e.g. the radiance map in voxel GI resolves, which then read red)
+static int rt_unit_slot(kinc_g4_texture_unit_t unit) {
+	int slot = unit.stages[KINC_G4_SHADER_TYPE_FRAGMENT];
+	return slot >= 0 ? slot : unit.stages[KINC_G4_SHADER_TYPE_COMPUTE];
+}
+
 void kinc_g4_render_target_use_color_as_texture(kinc_g4_render_target_t *renderTarget, kinc_g4_texture_unit_t unit) {
-	glActiveTexture(GL_TEXTURE0 + unit.stages[KINC_G4_SHADER_TYPE_FRAGMENT]);
+	glActiveTexture(GL_TEXTURE0 + rt_unit_slot(unit));
 	glCheckErrors();
 	glBindTexture(renderTarget->isCubeMap ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, renderTarget->impl._texture);
 	glCheckErrors();
 }
 
 void kinc_g4_render_target_use_depth_as_texture(kinc_g4_render_target_t *renderTarget, kinc_g4_texture_unit_t unit) {
-	glActiveTexture(GL_TEXTURE0 + unit.stages[KINC_G4_SHADER_TYPE_FRAGMENT]);
+	glActiveTexture(GL_TEXTURE0 + rt_unit_slot(unit));
 	glCheckErrors();
 	glBindTexture(renderTarget->isCubeMap ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, renderTarget->impl._depthTexture);
 	glCheckErrors();
