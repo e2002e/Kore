@@ -21,5 +21,6 @@ typedef struct {
 	int depth;               // > 1 or is_3d for 3D textures
 	bool is_3d;
 	VkFormat format;
-	VkImageView uint_view;   // R32_UINT view of 32-bit single-channel images (GL-style r32ui image access), else VK_NULL_HANDLE
+	VkImageView uint_view;   // R32_UINT view of 32-bit images (GL-style r32ui image access), else VK_NULL_HANDLE
+	bool storage;            // created with VK_IMAGE_USAGE_STORAGE_BIT
 } Texture5Impl;

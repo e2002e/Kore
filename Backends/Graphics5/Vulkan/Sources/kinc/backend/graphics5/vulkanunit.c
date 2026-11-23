@@ -78,6 +78,7 @@ static VkDescriptorSetLayout compute_descriptor_layout;
 #include "Vulkan.c.h"
 #include "rtcache.c.h"
 #include "spirvfix.c.h"
+#include "descriptors.c.h"
 #include "commandlist.c.h"
 #include "compute.c.h"
 #include "constantbuffer.c.h"

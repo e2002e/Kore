@@ -132,16 +132,20 @@ static void add_offset(uint32_t id, uint32_t offset) {
 typedef struct {
 	uint32_t binding;
 	uint8_t kind;
+	uint8_t storage;   // image load/store (OpTypeImage Sampled = 2), not a sampled texture
+	uint32_t format;   // SPIR-V ImageFormat of storage images
 } parsed_texture_kind;
 static parsed_texture_kind parsed_texture_kinds[32];
 static int parsed_texture_kinds_count = 0;
 
 typedef struct {
 	uint16_t op;
-	uint32_t a, b, c;
+	uint32_t a, b, c, d, e;
 } spv_id_info;
 
-static uint8_t resolve_texture_kind(spv_id_info *ids, uint32_t bound, uint32_t variable) {
+static uint8_t resolve_texture_kind(spv_id_info *ids, uint32_t bound, uint32_t variable, uint8_t *storage, uint32_t *format) {
+	*storage = 0;
+	*format = 0;
 	if (variable >= bound || ids[variable].op != 59) { // OpVariable
 		return KINC_VK_TEXTURE_KIND_UNKNOWN;
 	}
@@ -152,11 +156,17 @@ static uint8_t resolve_texture_kind(spv_id_info *ids, uint32_t bound, uint32_t v
 	if (t < bound && ids[t].op == 28) { // OpTypeArray
 		t = ids[t].a;
 	}
+	bool sampled_image = false;
 	if (t < bound && ids[t].op == 27) { // OpTypeSampledImage
 		t = ids[t].a;
+		sampled_image = true;
 	}
 	if (t >= bound || ids[t].op != 25) { // OpTypeImage
 		return KINC_VK_TEXTURE_KIND_UNKNOWN;
+	}
+	if (!sampled_image && ids[t].d == 2) {
+		*storage = 1;
+		*format = ids[t].e;
 	}
 	uint32_t dim = ids[t].a;
 	bool depth = ids[t].b == 1;
@@ -223,6 +233,8 @@ static void parse_shader(uint32_t *shader_source, int shader_length, kinc_intern
 				ids[operands[0]].a = operands[2];
 				ids[operands[0]].b = operands[3];
 				ids[operands[0]].c = operands[4];
+				ids[operands[0]].d = operands[6]; // Sampled: 1 sampled, 2 storage
+				ids[operands[0]].e = operands[7]; // Image format
 			}
 			break;
 		case 27: // OpTypeSampledImage: result, image type
@@ -289,7 +301,8 @@ static void parse_shader(uint32_t *shader_source, int shader_length, kinc_intern
 		}
 		if (ids != NULL && parsed_texture_kinds_count < 32) {
 			parsed_texture_kinds[parsed_texture_kinds_count].binding = bindings[i].value;
-			parsed_texture_kinds[parsed_texture_kinds_count].kind = resolve_texture_kind(ids, bound, bindings[i].id);
+			parsed_texture_kinds[parsed_texture_kinds_count].kind = resolve_texture_kind(ids, bound, bindings[i].id, &parsed_texture_kinds[parsed_texture_kinds_count].storage,
+			                                                                             &parsed_texture_kinds[parsed_texture_kinds_count].format);
 			parsed_texture_kinds_count++;
 		}
 	}
@@ -360,6 +373,10 @@ void kinc_g5_pipeline_destroy(kinc_g5_pipeline_t *pipeline) {
 	pipeline->impl.pipeline_layout = VK_NULL_HANDLE;
 	vkDestroyShaderModule(vk_ctx.device, pipeline->impl.vert_shader_module, NULL);
 	vkDestroyShaderModule(vk_ctx.device, pipeline->impl.frag_shader_module, NULL);
+	if (pipeline->impl.geom_shader_module != VK_NULL_HANDLE) {
+		vkDestroyShaderModule(vk_ctx.device, pipeline->impl.geom_shader_module, NULL);
+		pipeline->impl.geom_shader_module = VK_NULL_HANDLE;
+	}
 	pipeline->impl.vert_shader_module = VK_NULL_HANDLE;
 	pipeline->impl.frag_shader_module = VK_NULL_HANDLE;
 }
@@ -569,13 +586,20 @@ static VkFormat convert_vertex_format(kinc_g4_vertex_data_t data) {
 	}
 }
 
-static void record_texture_kinds(kinc_g5_pipeline_t *pipeline) {
+// Copies what the last parse_shader call found about sampler/image bindings 2..17 into per-slot arrays
+static void record_bindings(uint8_t *kinds, uint8_t *storage, uint32_t *formats) {
 	for (int i = 0; i < parsed_texture_kinds_count; ++i) {
 		uint32_t binding = parsed_texture_kinds[i].binding;
 		if (binding >= 2 && binding < 18 && parsed_texture_kinds[i].kind != KINC_VK_TEXTURE_KIND_UNKNOWN) {
-			pipeline->impl.texture_kinds[binding - 2] = parsed_texture_kinds[i].kind;
+			kinds[binding - 2] = parsed_texture_kinds[i].kind;
+			storage[binding - 2] = parsed_texture_kinds[i].storage;
+			formats[binding - 2] = parsed_texture_kinds[i].format;
 		}
 	}
+}
+
+static void record_texture_kinds(kinc_g5_pipeline_t *pipeline) {
+	record_bindings(pipeline->impl.texture_kinds, pipeline->impl.texture_storage, pipeline->impl.texture_formats);
 }
 
 void kinc_g5_pipeline_compile(kinc_g5_pipeline_t *pipeline) {
@@ -585,6 +609,8 @@ void kinc_g5_pipeline_compile(kinc_g5_pipeline_t *pipeline) {
 	memset(pipeline->impl.fragmentOffsets, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
 	memset(pipeline->impl.textureBindings, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
 	memset(pipeline->impl.texture_kinds, 0, sizeof(pipeline->impl.texture_kinds));
+	memset(pipeline->impl.texture_storage, 0, sizeof(pipeline->impl.texture_storage));
+	memset(pipeline->impl.texture_formats, 0, sizeof(pipeline->impl.texture_formats));
 	parse_shader((uint32_t *)pipeline->vertexShader->impl.source, pipeline->vertexShader->impl.length, pipeline->impl.vertexLocations,
 	             pipeline->impl.textureBindings, pipeline->impl.vertexOffsets);
 	record_texture_kinds(pipeline);
@@ -592,11 +618,41 @@ void kinc_g5_pipeline_compile(kinc_g5_pipeline_t *pipeline) {
 	             pipeline->impl.textureBindings, pipeline->impl.fragmentOffsets);
 	record_texture_kinds(pipeline);
 
+	// Optional geometry stage. Its uniforms (binding 1) read the fragment stage's buffer, so its block is
+	// laid out like the fragment block: members are matched by name.
+	pipeline->impl.geom_shader_module = VK_NULL_HANDLE;
+	bool has_geometry = pipeline->geometryShader != NULL && pipeline->geometryShader->impl.source != NULL;
+	if (has_geometry) {
+		kinc_internal_named_number geometry_locations[KINC_INTERNAL_NAMED_NUMBER_COUNT];
+		kinc_internal_named_number geometry_offsets[KINC_INTERNAL_NAMED_NUMBER_COUNT];
+		memset(geometry_locations, 0, sizeof(geometry_locations));
+		memset(geometry_offsets, 0, sizeof(geometry_offsets));
+		parse_shader((uint32_t *)pipeline->geometryShader->impl.source, pipeline->geometryShader->impl.length, geometry_locations, pipeline->impl.textureBindings,
+		             geometry_offsets);
+		record_texture_kinds(pipeline);
+
+		size_t length = 0;
+		uint32_t *remapped = kinc_vulkan_remap_block_offsets((const uint32_t *)pipeline->geometryShader->impl.source, pipeline->geometryShader->impl.length,
+		                                                     pipeline->impl.fragmentOffsets, &length);
+		if (remapped != NULL) {
+			pipeline->impl.geom_shader_module = create_shader_module(remapped, length);
+			free(remapped);
+		}
+		else {
+			pipeline->impl.geom_shader_module = create_shader_module(pipeline->geometryShader->impl.source, pipeline->geometryShader->impl.length);
+		}
+	}
+
+	VkShaderStageFlags geometry_stage = has_geometry ? VK_SHADER_STAGE_GEOMETRY_BIT : 0;
+	pipeline->impl.set_layout = kinc_vk_get_set_layout(pipeline->impl.texture_storage, VK_SHADER_STAGE_VERTEX_BIT,
+	                                                   VK_SHADER_STAGE_FRAGMENT_BIT | geometry_stage,
+	                                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | geometry_stage);
+
 	VkPipelineLayoutCreateInfo pPipelineLayoutCreateInfo = {0};
 	pPipelineLayoutCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 	pPipelineLayoutCreateInfo.pNext = NULL;
 	pPipelineLayoutCreateInfo.setLayoutCount = 1;
-	pPipelineLayoutCreateInfo.pSetLayouts = &desc_layout;
+	pPipelineLayoutCreateInfo.pSetLayouts = &pipeline->impl.set_layout;
 
 	VkResult err = vkCreatePipelineLayout(vk_ctx.device, &pPipelineLayoutCreateInfo, NULL, &pipeline->impl.pipeline_layout);
 	assert(!err);
@@ -720,9 +776,15 @@ static VkPipeline create_pipeline_variant(kinc_g5_pipeline_t *pipeline, VkRender
 	ms.pSampleMask = NULL;
 	ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-	pipeline_info.stageCount = 2;
-	VkPipelineShaderStageCreateInfo shaderStages[2];
-	memset(&shaderStages, 0, 2 * sizeof(VkPipelineShaderStageCreateInfo));
+	pipeline_info.stageCount = pipeline->impl.geom_shader_module != VK_NULL_HANDLE ? 3 : 2;
+	VkPipelineShaderStageCreateInfo shaderStages[3];
+	memset(&shaderStages, 0, 3 * sizeof(VkPipelineShaderStageCreateInfo));
+	if (pipeline->impl.geom_shader_module != VK_NULL_HANDLE) {
+		shaderStages[2].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		shaderStages[2].stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+		shaderStages[2].module = pipeline->impl.geom_shader_module;
+		shaderStages[2].pName = "main";
+	}
 
 	shaderStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	shaderStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -946,6 +1008,7 @@ static void update_textures(struct destriptor_set *set) {
 }
 
 void reuse_descriptor_sets(void) {
+	kinc_vk_reuse_descriptor_sets();
 	for (int i = 0; i < descriptor_sets_count; ++i) {
 		descriptor_sets[i].in_use = false;
 	}

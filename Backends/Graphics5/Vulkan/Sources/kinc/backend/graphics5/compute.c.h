@@ -8,6 +8,9 @@ static void parse_shader(uint32_t *shader_source, int shader_length, kinc_intern
                          kinc_internal_named_number *uniformOffsets);
 
 static VkShaderModule create_shader_module(const void *code, size_t size);
+static bool has_number(kinc_internal_named_number *named_numbers, const char *name);
+static uint32_t find_number(kinc_internal_named_number *named_numbers, const char *name);
+static void record_bindings(uint8_t *kinds, uint8_t *storage, uint32_t *formats);
 
 static VkDescriptorPool compute_descriptor_pool;
 
@@ -75,12 +78,18 @@ void kinc_g5_compute_shader_init(kinc_g5_compute_shader *shader, void *_data, in
 	memset(shader->impl.offsets, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
 	memset(shader->impl.texture_bindings, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
 	parse_shader((uint32_t *)_data, length, shader->impl.locations, shader->impl.texture_bindings, shader->impl.offsets);
+	memset(shader->impl.texture_kinds, 0, sizeof(shader->impl.texture_kinds));
+	memset(shader->impl.texture_storage, 0, sizeof(shader->impl.texture_storage));
+	memset(shader->impl.texture_formats, 0, sizeof(shader->impl.texture_formats));
+	record_bindings(shader->impl.texture_kinds, shader->impl.texture_storage, shader->impl.texture_formats);
+	shader->impl.set_layout = kinc_vk_get_set_layout(shader->impl.texture_storage, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_STAGE_COMPUTE_BIT,
+	                                                 VK_SHADER_STAGE_COMPUTE_BIT);
 
 	VkPipelineLayoutCreateInfo pPipelineLayoutCreateInfo = {0};
 	pPipelineLayoutCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 	pPipelineLayoutCreateInfo.pNext = NULL;
 	pPipelineLayoutCreateInfo.setLayoutCount = 1;
-	pPipelineLayoutCreateInfo.pSetLayouts = &compute_descriptor_layout;
+	pPipelineLayoutCreateInfo.pSetLayouts = &shader->impl.set_layout;
 
 	VkResult err = vkCreatePipelineLayout(vk_ctx.device, &pPipelineLayoutCreateInfo, NULL, &shader->impl.pipeline_layout);
 	assert(!err);
@@ -195,60 +204,36 @@ void kinc_g5_compute_shader_destroy(kinc_g5_compute_shader *shader) {
 }
 
 kinc_g5_constant_location_t kinc_g5_compute_shader_get_constant_location(kinc_g5_compute_shader *shader, const char *name) {
-	kinc_g5_constant_location_t location = {0};
-
-	uint32_t hash = kinc_internal_hash_name((unsigned char *)name);
-
-	/*kinc_compute_internal_shader_constant_t *constant = findComputeConstant(shader->impl.constants, hash);
-	if (constant == NULL) {
-	    location.impl.computeOffset = 0;
+	kinc_g5_constant_location_t location;
+	location.impl.vertexOffset = -1;
+	location.impl.fragmentOffset = -1;
+	location.impl.computeOffset = -1;
+	if (has_number(shader->impl.offsets, name)) {
+		location.impl.computeOffset = find_number(shader->impl.offsets, name);
 	}
-	else {
-	    location.impl.computeOffset = constant->offset;
-	}
-
-	if (location.impl.computeOffset == 0) {
-	    kinc_log(KINC_LOG_LEVEL_WARNING, "Uniform %s not found.", name);
-	}*/
-
 	return location;
 }
 
 kinc_g5_texture_unit_t kinc_g5_compute_shader_get_texture_unit(kinc_g5_compute_shader *shader, const char *name) {
-	char unitName[64];
-	int unitOffset = 0;
-	size_t len = strlen(name);
-	if (len > 63)
-		len = 63;
-	strncpy(unitName, name, len + 1);
-	if (unitName[len - 1] == ']') {                  // Check for array - mySampler[2]
-		unitOffset = (int)(unitName[len - 2] - '0'); // Array index is unit offset
-		unitName[len - 3] = 0;                       // Strip array from name
-	}
-
-	uint32_t hash = kinc_internal_hash_name((unsigned char *)unitName);
-
 	kinc_g5_texture_unit_t unit;
 	for (int i = 0; i < KINC_G5_SHADER_TYPE_COUNT; ++i) {
 		unit.stages[i] = -1;
 	}
-	unit.stages[KINC_G5_SHADER_TYPE_COMPUTE] = 0;
-	/*kinc_internal_hash_index_t *compute_unit = findComputeTextureUnit(shader->impl.textures, hash);
-	if (compute_unit == NULL) {
-#ifndef NDEBUG
-	    static int notFoundCount = 0;
-	    if (notFoundCount < 10) {
-	        kinc_log(KINC_LOG_LEVEL_WARNING, "Sampler %s not found.", unitName);
-	        ++notFoundCount;
-	    }
-	    else if (notFoundCount == 10) {
-	        kinc_log(KINC_LOG_LEVEL_WARNING, "Giving up on sampler not found messages.", unitName);
-	        ++notFoundCount;
-	    }
-#endif
+	// Sampler arrays ("name[0]") are one binding named without the index (element 0 only)
+	char base_name[64];
+	const char *bracket = strchr(name, '[');
+	int array_index = 0;
+	if (bracket != NULL && (size_t)(bracket - name) < sizeof(base_name)) {
+		memcpy(base_name, name, bracket - name);
+		base_name[bracket - name] = 0;
+		array_index = atoi(bracket + 1);
+		name = base_name;
 	}
-	else {
-	    unit.stages[KINC_G5_SHADER_TYPE_COMPUTE] = compute_unit->index + unitOffset;
-	}*/
+	if (array_index == 0 && has_number(shader->impl.texture_bindings, name)) {
+		int binding = (int)find_number(shader->impl.texture_bindings, name);
+		if (binding >= 2 && binding < 18) {
+			unit.stages[KINC_G5_SHADER_TYPE_COMPUTE] = binding - 2;
+		}
+	}
 	return unit;
 }

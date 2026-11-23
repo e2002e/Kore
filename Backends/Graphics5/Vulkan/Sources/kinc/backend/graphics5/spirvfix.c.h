@@ -3,8 +3,9 @@
 // krafix sometimes emits arrays in "_k_global_uniform_buffer_type" without an ArrayStride and sizes
 // them as a single element (seen for vec4 arrays that are also passed to functions by value, e.g.
 // Armory's shirr[7]). Following members then overlap the array, so uploading one uniform corrupts
-// the other. This recomputes the block's member offsets with std140 rules and adds the missing
-// ArrayStride decorations. Kore reads the offsets back from the (fixed) SPIR-V, so the CPU side
+// the other. This recomputes the block's member offsets and adds the missing ArrayStride decorations.
+// Kore binds these blocks as storage buffers, so the std430 rules apply (arrays of scalars and vec2
+// are tightly packed, which is also how kinc_g5_constant_buffer_set_floats writes them). Kore reads the offsets back from the (fixed) SPIR-V, so the CPU side
 // follows automatically.
 
 #include <stdint.h>
@@ -49,18 +50,18 @@ static bool spvfix_layout(spvfix_id *ids, uint32_t bound, const uint32_t *consta
 		*size = 4 * t->b;
 		*align = t->b == 2 ? 8 : 16;
 		return true;
-	case SPV_OP_TYPE_MATRIX: // column-major, std140 column stride 16
+	case SPV_OP_TYPE_MATRIX: // column-major float vec3/vec4 columns: stride 16 in std140 and std430
 		*size = 16 * t->b;
 		*align = 16;
 		return true;
-	case SPV_OP_TYPE_ARRAY: {
+	case SPV_OP_TYPE_ARRAY: { // std430: element size rounded up to its alignment
 		uint32_t element_size, element_align;
 		if (!spvfix_layout(ids, bound, constants, t->a, &element_size, &element_align, depth + 1) || t->b >= bound) {
 			return false;
 		}
-		uint32_t stride = (element_size + 15) & ~15u;
+		uint32_t stride = (element_size + element_align - 1) & ~(element_align - 1);
 		*size = stride * constants[t->b];
-		*align = 16;
+		*align = element_align;
 		return true;
 	}
 	default:
@@ -166,7 +167,7 @@ static uint32_t *kinc_vulkan_fix_uniform_layout(const uint32_t *code, size_t len
 				uint32_t element_size, element_align;
 				spvfix_layout(ids, bound, constants, ids[type].a, &element_size, &element_align, 0);
 				missing_strides[missing_count * 2] = type;
-				missing_strides[missing_count * 2 + 1] = (element_size + 15) & ~15u;
+				missing_strides[missing_count * 2 + 1] = (element_size + element_align - 1) & ~(element_align - 1);
 				ids[type].has_array_stride = true;
 				missing_count++;
 			}
@@ -229,5 +230,179 @@ static uint32_t *kinc_vulkan_fix_uniform_layout(const uint32_t *code, size_t len
 
 	free(ids);
 	free(constants);
+	return result;
+}
+
+// Returns a malloc'd copy of the code whose "_k_global_uniform_buffer_type" member offsets are replaced
+// by the offsets of the same-named members in offsets_by_name (another stage's block sharing the same
+// buffer), or NULL when nothing changed. Members without a match keep their offset.
+static uint32_t *kinc_vulkan_remap_block_offsets(const uint32_t *code, size_t length, kinc_internal_named_number *offsets_by_name, size_t *out_length) {
+	size_t word_count = length / 4;
+	if (word_count < 5 || code[0] != 0x07230203) {
+		return NULL;
+	}
+	uint32_t *result = (uint32_t *)malloc(length);
+	if (result == NULL) {
+		return NULL;
+	}
+	memcpy(result, code, length);
+
+	uint32_t block = 0;
+	const char *member_names[64] = {NULL};
+	bool changed = false;
+	for (size_t i = 5; i < word_count;) {
+		uint32_t count = result[i] >> 16;
+		uint32_t op = result[i] & 0xffff;
+		if (count == 0 || i + count > word_count) {
+			break;
+		}
+		uint32_t *o = &result[i + 1];
+		if (op == SPV_OP_NAME && strcmp((const char *)&o[1], "_k_global_uniform_buffer_type") == 0) {
+			block = o[0];
+		}
+		else if (op == 6 /* OpMemberName */ && block != 0 && o[0] == block && o[1] < 64) {
+			member_names[o[1]] = (const char *)&o[2];
+		}
+		else if (op == SPV_OP_MEMBER_DECORATE && block != 0 && o[0] == block && o[2] == SPV_DECORATION_OFFSET && o[1] < 64 && member_names[o[1]] != NULL) {
+			bool found = false;
+			for (int n = 0; n < KINC_INTERNAL_NAMED_NUMBER_COUNT; ++n) {
+				if (offsets_by_name[n].name[0] != 0 && strcmp(offsets_by_name[n].name, member_names[o[1]]) == 0) {
+					if (o[3] != offsets_by_name[n].number) {
+						o[3] = offsets_by_name[n].number;
+						changed = true;
+					}
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				kinc_log(KINC_LOG_LEVEL_WARNING, "Geometry shader uniform %s is not a fragment shader uniform, it can not be set", member_names[o[1]]);
+			}
+		}
+		i += count;
+	}
+	if (!changed) {
+		free(result);
+		return NULL;
+	}
+	*out_length = length;
+	return result;
+}
+
+// krafix numbers stage interface variables 0, 1, 2... (by name), one location each, even for arrays
+// and matrices that span several locations, so e.g. a vec4[3] at 5 overlaps the variables at 6 and 7.
+// GL links varyings by name and never noticed; Vulkan links by location. Each location is shifted by
+// the extra locations of the variables before it. Both sides of an interface get the same shift as long
+// as they declare the same variables, which keeps them matching.
+// storage_class: 1 Input, 3 Output. Returns a malloc'd copy or NULL when nothing changed.
+static uint32_t spvfix_location_slots(const uint32_t *code, size_t word_count, uint32_t type, int depth) {
+	if (depth > 8) {
+		return 1;
+	}
+	for (size_t i = 5; i < word_count;) {
+		uint32_t count = code[i] >> 16;
+		uint32_t op = code[i] & 0xffff;
+		if (count == 0) {
+			break;
+		}
+		if ((op == SPV_OP_TYPE_MATRIX || op == SPV_OP_TYPE_ARRAY || op == 32 /* OpTypePointer */) && code[i + 1] == type) {
+			if (op == 32) {
+				return spvfix_location_slots(code, word_count, code[i + 3], depth + 1);
+			}
+			if (op == SPV_OP_TYPE_MATRIX) {
+				return code[i + 3];
+			}
+			// Array: length is a constant id
+			uint32_t length_id = code[i + 3];
+			uint32_t length = 1;
+			for (size_t j = 5; j < word_count;) {
+				uint32_t c = code[j] >> 16;
+				if (c == 0) {
+					break;
+				}
+				if ((code[j] & 0xffff) == SPV_OP_CONSTANT && code[j + 2] == length_id) {
+					length = code[j + 3];
+					break;
+				}
+				j += c;
+			}
+			return length * spvfix_location_slots(code, word_count, code[i + 2], depth + 1);
+		}
+		i += count;
+	}
+	return 1;
+}
+
+static uint32_t *kinc_vulkan_fix_interface_locations(const uint32_t *code, size_t length, uint32_t storage_class) {
+	size_t word_count = length / 4;
+	if (word_count < 5 || code[0] != 0x07230203) {
+		return NULL;
+	}
+	// Interface variables of the storage class with their pointer type
+	uint32_t vars[64], var_types[64];
+	int var_count = 0;
+	for (size_t i = 5; i < word_count && var_count < 64;) {
+		uint32_t count = code[i] >> 16;
+		if (count == 0) {
+			break;
+		}
+		if ((code[i] & 0xffff) == 59 /* OpVariable */ && code[i + 3] == storage_class) {
+			vars[var_count] = code[i + 2];
+			var_types[var_count] = code[i + 1];
+			var_count++;
+		}
+		i += count;
+	}
+	// Their Location decorations and slot counts
+	int locations[64];
+	uint32_t slots[64];
+	bool any_multi = false;
+	for (int v = 0; v < var_count; ++v) {
+		locations[v] = -1;
+		for (size_t i = 5; i < word_count;) {
+			uint32_t count = code[i] >> 16;
+			if (count == 0) {
+				break;
+			}
+			if ((code[i] & 0xffff) == SPV_OP_DECORATE && code[i + 1] == vars[v] && code[i + 2] == 30 /* Location */) {
+				locations[v] = (int)code[i + 3];
+				break;
+			}
+			i += count;
+		}
+		slots[v] = spvfix_location_slots(code, word_count, var_types[v], 0);
+		if (slots[v] > 1 && locations[v] >= 0) {
+			any_multi = true;
+		}
+	}
+	if (!any_multi) {
+		return NULL;
+	}
+	uint32_t *result = (uint32_t *)malloc(length);
+	if (result == NULL) {
+		return NULL;
+	}
+	memcpy(result, code, length);
+	for (size_t i = 5; i < word_count;) {
+		uint32_t count = result[i] >> 16;
+		if (count == 0) {
+			break;
+		}
+		if ((result[i] & 0xffff) == SPV_OP_DECORATE && result[i + 2] == 30) {
+			for (int v = 0; v < var_count; ++v) {
+				if (vars[v] == result[i + 1] && locations[v] >= 0) {
+					uint32_t extra = 0;
+					for (int w = 0; w < var_count; ++w) {
+						if (locations[w] >= 0 && locations[w] < locations[v]) {
+							extra += slots[w] - 1;
+						}
+					}
+					result[i + 3] = (uint32_t)locations[v] + extra;
+					break;
+				}
+			}
+		}
+		i += count;
+	}
 	return result;
 }

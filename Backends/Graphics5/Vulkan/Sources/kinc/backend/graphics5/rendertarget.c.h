@@ -383,6 +383,14 @@ void kinc_g5_render_target_destroy(kinc_g5_render_target_t *target) {
 	else {
 		// Rare; make sure nothing in flight still uses the images or their framebuffers
 		vkQueueWaitIdle(vk_ctx.queue);
+		kinc_vk_forget_image_view(target->impl.sourceView);
+		kinc_vk_forget_image_view(target->impl.depthView);
+		if (target->impl.is_cube) {
+			for (int face = 0; face < 6; ++face) {
+				kinc_vk_forget_image_view(target->impl.face_views[face]);
+				kinc_vk_forget_image_view(target->impl.face_depth_views[face]);
+			}
+		}
 		release_rt_framebuffers_using(target->impl.sourceView);
 		if (target->impl.is_cube) {
 			for (int face = 0; face < 6; ++face) {

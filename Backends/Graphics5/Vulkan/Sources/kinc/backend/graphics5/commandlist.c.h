@@ -7,6 +7,7 @@
 #include <kinc/graphics5/pipeline.h>
 #include <kinc/graphics5/vertexbuffer.h>
 #include <kinc/log.h>
+#include <kinc/graphics5/constantbuffer.h>
 #include <kinc/window.h>
 #include <vulkan/vulkan_core.h>
 
@@ -479,7 +480,11 @@ void kinc_vulkan_end_external_commands(void) {
 }
 
 void kinc_g5_command_list_end(kinc_g5_command_list_t *list) {
-	vkCmdEndRenderPass(list->impl._buffer);
+	// A compute dispatch may have ended the pass without one being resumed
+	if (in_render_pass) {
+		vkCmdEndRenderPass(list->impl._buffer);
+		in_render_pass = false;
+	}
 
 	VkImageMemoryBarrier prePresentBarrier = {0};
 	prePresentBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -878,14 +883,23 @@ void kinc_g5_command_list_render_target_to_texture_barrier(kinc_g5_command_list_
 	// render-passes are used to transition render-targets
 }
 
+// The buffers passed in by G4onG5. vk_ctx.*_uniform_buffer is a global guess reset by any later
+// kinc_g5_constant_buffer_init, which left bindings unwritten (GPU hang).
+static VkBuffer current_vertex_buffer = VK_NULL_HANDLE;
+static VkBuffer current_fragment_buffer = VK_NULL_HANDLE;
+
 void kinc_g5_command_list_set_vertex_constant_buffer(kinc_g5_command_list_t *list, struct kinc_g5_constant_buffer *buffer, int offset, size_t size) {
 	lastVertexConstantBufferOffset = offset;
+	current_vertex_buffer = buffer->impl.buf;
 }
 
 void kinc_g5_command_list_set_fragment_constant_buffer(kinc_g5_command_list_t *list, struct kinc_g5_constant_buffer *buffer, int offset, size_t size) {
 	lastFragmentConstantBufferOffset = offset;
+	current_fragment_buffer = buffer->impl.buf;
 
-	VkDescriptorSet descriptor_set = getDescriptorSet();
+	VkDescriptorSet descriptor_set = kinc_vk_get_descriptor_set(
+	    currentPipeline->impl.set_layout, current_vertex_buffer, current_fragment_buffer, currentPipeline->impl.texture_kinds,
+	    currentPipeline->impl.texture_storage, currentPipeline->impl.texture_formats);
 	uint32_t offsets[2] = {lastVertexConstantBufferOffset, lastFragmentConstantBufferOffset};
 	vkCmdBindDescriptorSets(list->impl._buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, currentPipeline->impl.pipeline_layout, 0, 1, &descriptor_set, 2, offsets);
 }
@@ -893,7 +907,10 @@ void kinc_g5_command_list_set_fragment_constant_buffer(kinc_g5_command_list_t *l
 void kinc_g5_command_list_set_compute_constant_buffer(kinc_g5_command_list_t *list, struct kinc_g5_constant_buffer *buffer, int offset, size_t size) {
 	lastComputeConstantBufferOffset = offset;
 
-	VkDescriptorSet descriptor_set = get_compute_descriptor_set();
+	VkBuffer compute_buffer = buffer->impl.buf;
+	VkDescriptorSet descriptor_set =
+	    kinc_vk_get_descriptor_set(current_compute_shader->impl.set_layout, compute_buffer, compute_buffer, current_compute_shader->impl.texture_kinds,
+	                               current_compute_shader->impl.texture_storage, current_compute_shader->impl.texture_formats);
 	uint32_t offsets[2] = {lastComputeConstantBufferOffset, lastComputeConstantBufferOffset};
 	vkCmdBindDescriptorSets(list->impl._buffer, VK_PIPELINE_BIND_POINT_COMPUTE, current_compute_shader->impl.pipeline_layout, 0, 1, &descriptor_set, 2,
 	                        offsets);
@@ -946,23 +963,46 @@ void kinc_g5_command_list_wait_for_execution_to_finish(kinc_g5_command_list_t *l
 	check_fence_wait(err);
 }
 
+// Texture slot of a unit: names map to one binding for all stages, so take whichever stage uses it
+// (compute units and vertex/geometry-only ones have no fragment index)
+static int unit_slot(kinc_g5_texture_unit_t unit) {
+	static const int order[] = {KINC_G5_SHADER_TYPE_FRAGMENT, KINC_G5_SHADER_TYPE_COMPUTE, KINC_G5_SHADER_TYPE_VERTEX, KINC_G5_SHADER_TYPE_GEOMETRY};
+	for (int i = 0; i < 4; ++i) {
+		int slot = unit.stages[order[i]];
+		if (slot >= 0 && slot < 16) {
+			return slot;
+		}
+	}
+	return -1;
+}
+
 void kinc_g5_command_list_set_texture(kinc_g5_command_list_t *list, kinc_g5_texture_unit_t unit, kinc_g5_texture_t *texture) {
-	vulkanTextures[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = texture;
-	vulkanRenderTargets[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = NULL;
-	vulkanRenderTargetsDepth[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = false;
+	int slot = unit_slot(unit);
+	if (slot < 0) {
+		return;
+	}
+	vulkanTextures[slot] = texture;
+	vulkanRenderTargets[slot] = NULL;
+	vulkanRenderTargetsDepth[slot] = false;
 }
 
 void kinc_g5_command_list_set_sampler(kinc_g5_command_list_t *list, kinc_g5_texture_unit_t unit, kinc_g5_sampler_t *sampler) {
-	if (unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT] >= 0) {
-		vulkanSamplers[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = sampler->impl.sampler;
-		vulkanSamplersPlain[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = sampler->impl.sampler_plain;
-		vulkanSamplersCompare[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = sampler->impl.sampler_compare;
+	int slot = unit_slot(unit);
+	if (slot >= 0) {
+		vulkanSamplers[slot] = sampler->impl.sampler;
+		vulkanSamplersPlain[slot] = sampler->impl.sampler_plain;
+		vulkanSamplersCompare[slot] = sampler->impl.sampler_compare;
 	}
 }
 
 void kinc_g5_command_list_set_image_texture(kinc_g5_command_list_t *list, kinc_g5_texture_unit_t unit, kinc_g5_texture_t *texture) {
-	vulkanTextures[unit.stages[KINC_G5_SHADER_TYPE_COMPUTE]] = texture;
-	vulkanRenderTargets[unit.stages[KINC_G5_SHADER_TYPE_COMPUTE]] = NULL;
+	int slot = unit_slot(unit);
+	if (slot < 0) {
+		return;
+	}
+	vulkanTextures[slot] = texture;
+	vulkanRenderTargets[slot] = NULL;
+	vulkanRenderTargetsDepth[slot] = false;
 }
 
 void kinc_g5_command_list_set_render_target_face(kinc_g5_command_list_t *list, kinc_g5_render_target_t *texture, int face) {
@@ -989,17 +1029,25 @@ bool kinc_g5_command_list_are_query_results_available(kinc_g5_command_list_t *li
 void kinc_g5_command_list_get_query_result(kinc_g5_command_list_t *list, unsigned occlusionQuery, unsigned *pixelCount) {}
 
 void kinc_g5_command_list_set_texture_from_render_target(kinc_g5_command_list_t *list, kinc_g5_texture_unit_t unit, kinc_g5_render_target_t *target) {
-	target->impl.stage = unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT];
-	vulkanRenderTargets[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = target;
-	vulkanRenderTargetsDepth[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = false;
-	vulkanTextures[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = NULL;
+	int slot = unit_slot(unit);
+	if (slot < 0) {
+		return;
+	}
+	target->impl.stage = slot;
+	vulkanRenderTargets[slot] = target;
+	vulkanRenderTargetsDepth[slot] = false;
+	vulkanTextures[slot] = NULL;
 }
 
 void kinc_g5_command_list_set_texture_from_render_target_depth(kinc_g5_command_list_t *list, kinc_g5_texture_unit_t unit, kinc_g5_render_target_t *target) {
-	target->impl.stage_depth = unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT];
-	vulkanRenderTargets[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = target;
-	vulkanRenderTargetsDepth[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = true;
-	vulkanTextures[unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT]] = NULL;
+	int slot = unit_slot(unit);
+	if (slot < 0) {
+		return;
+	}
+	target->impl.stage_depth = slot;
+	vulkanRenderTargets[slot] = target;
+	vulkanRenderTargetsDepth[slot] = true;
+	vulkanTextures[slot] = NULL;
 }
 
 void kinc_g5_command_list_set_compute_shader(kinc_g5_command_list_t *list, kinc_g5_compute_shader *shader) {
@@ -1015,6 +1063,13 @@ void kinc_g5_command_list_compute(kinc_g5_command_list_t *list, int x, int y, in
 	}
 
 	vkCmdDispatch(list->impl._buffer, x, y, z);
+
+	// Image writes of this dispatch must be visible to later dispatches, draws and copies
+	VkMemoryBarrier barrier = {0};
+	barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+	vkCmdPipelineBarrier(list->impl._buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
 
 	int render_target_count = 0;
 	for (int i = 0; i < 8; ++i) {

@@ -39,6 +39,10 @@ typedef struct PipelineState5Impl_s {
 
 	// Image type per sampler slot (enum kinc_vk_texture_kind), for dummies in unbound slots
 	uint8_t texture_kinds[16];
+	uint8_t texture_storage[16];   // slot is an image load/store binding
+	uint32_t texture_formats[16];  // SPIR-V ImageFormat of storage slots
+	VkDescriptorSetLayout set_layout; // built from the bindings above (descriptors.c.h)
+	VkShaderModule geom_shader_module; // optional geometry stage
 } PipelineState5Impl;
 
 typedef struct ComputePipelineState5Impl_t {

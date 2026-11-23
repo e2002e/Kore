@@ -321,10 +321,15 @@ void kinc_g5_texture_init(kinc_g5_texture_t *texture, int width, int height, kin
 
 	vkGetPhysicalDeviceFormatProperties(vk_ctx.gpu, tex_format, &props);
 
-	// Device can texture using linear textures (transfer dst for kinc_g5_texture_clear)
-	prepare_texture_image(NULL, (uint32_t)width, (uint32_t)height, &texture->impl.texture, VK_IMAGE_TILING_LINEAR,
-	                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, &texture->impl.deviceSize,
-	                      tex_format);
+	// Linear so it stays lockable from the CPU; transfer dst for kinc_g5_texture_clear, storage when the
+	// format allows it on linear tiling (G4 images are also written by compute shaders, e.g. voxel GI)
+	VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	if (props.linearTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+		usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+		texture->impl.storage = true;
+	}
+	prepare_texture_image(NULL, (uint32_t)width, (uint32_t)height, &texture->impl.texture, VK_IMAGE_TILING_LINEAR, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+	                      &texture->impl.deviceSize, tex_format);
 
 	flush_init_cmd();
 
@@ -369,9 +374,10 @@ void kinc_g5_texture_init3d(kinc_g5_texture_t *texture, int width, int height, i
 	VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 	if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
 		usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+		texture->impl.storage = true;
 	}
-	// GL lets an r32f texture be bound as an r32ui image (atomics); Vulkan needs a mutable image and a uint view
-	bool uint_alias = tex_format == VK_FORMAT_R32_SFLOAT;
+	// GL lets any 32-bit texture be bound as an r32ui image (atomics); Vulkan needs a mutable image and a uint view
+	bool uint_alias = tex_format == VK_FORMAT_R32_SFLOAT || tex_format == VK_FORMAT_R8G8B8A8_UNORM || tex_format == VK_FORMAT_B8G8R8A8_UNORM;
 
 	VkImageCreateInfo image = {0};
 	image.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -473,6 +479,8 @@ void kinc_g5_texture_init_non_sampled_access(kinc_g5_texture_t *texture, int wid
 }
 
 void kinc_g5_texture_destroy(kinc_g5_texture_t *texture) {
+	kinc_vk_forget_image_view(texture->impl.texture.view);
+	kinc_vk_forget_image_view(texture->impl.uint_view);
 	if (texture->impl.uint_view != VK_NULL_HANDLE) {
 		vkDestroyImageView(vk_ctx.device, texture->impl.uint_view, NULL);
 	}

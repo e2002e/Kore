@@ -715,6 +715,47 @@ void kinc_g4_set_index_buffer(kinc_g4_index_buffer_t *buffer) {
 	kinc_g5_command_list_set_index_buffer(&commandList, g5_index_buffer);
 }
 
+// A texture slot holds one thing at a time: binding to it replaces whatever any of the three lists had
+// there. (Keying by the exact unit let graphics and compute units with different stage arrays pile up
+// past MAX_TEXTURES within a frame.)
+static int g4_unit_slot(const kinc_g5_texture_unit_t *unit) {
+	static const int order[] = {KINC_G5_SHADER_TYPE_FRAGMENT, KINC_G5_SHADER_TYPE_COMPUTE, KINC_G5_SHADER_TYPE_VERTEX, KINC_G5_SHADER_TYPE_GEOMETRY};
+	for (int i = 0; i < 4; ++i) {
+		if (unit->stages[order[i]] >= 0) {
+			return unit->stages[order[i]];
+		}
+	}
+	return -1;
+}
+
+static void g4_release_slot(const kinc_g5_texture_unit_t *unit) {
+	int slot = g4_unit_slot(unit);
+	if (slot < 0) {
+		return;
+	}
+	for (int i = current_state.texture_count - 1; i >= 0; --i) {
+		if (g4_unit_slot(&current_state.texture_units[i]) == slot) {
+			current_state.texture_count -= 1;
+			current_state.textures[i] = current_state.textures[current_state.texture_count];
+			current_state.texture_units[i] = current_state.texture_units[current_state.texture_count];
+		}
+	}
+	for (int i = current_state.render_target_count - 1; i >= 0; --i) {
+		if (g4_unit_slot(&current_state.render_target_units[i]) == slot) {
+			current_state.render_target_count -= 1;
+			current_state.render_targets[i] = current_state.render_targets[current_state.render_target_count];
+			current_state.render_target_units[i] = current_state.render_target_units[current_state.render_target_count];
+		}
+	}
+	for (int i = current_state.depth_render_target_count - 1; i >= 0; --i) {
+		if (g4_unit_slot(&current_state.depth_render_target_units[i]) == slot) {
+			current_state.depth_render_target_count -= 1;
+			current_state.depth_render_targets[i] = current_state.depth_render_targets[current_state.depth_render_target_count];
+			current_state.depth_render_target_units[i] = current_state.depth_render_target_units[current_state.depth_render_target_count];
+		}
+	}
+}
+
 void kinc_g4_set_texture(kinc_g4_texture_unit_t unit, kinc_g4_texture_t *texture) {
 	if (!texture->impl._uploaded) {
 		kinc_g5_command_list_upload_texture(&commandList, &texture->impl._texture);
@@ -724,6 +765,7 @@ void kinc_g4_set_texture(kinc_g4_texture_unit_t unit, kinc_g4_texture_t *texture
 	assert(KINC_G4_SHADER_TYPE_COUNT == KINC_G5_SHADER_TYPE_COUNT);
 	kinc_g5_texture_unit_t g5_unit;
 	memcpy(&g5_unit.stages[0], &unit.stages[0], KINC_G5_SHADER_TYPE_COUNT * sizeof(int));
+	g4_release_slot(&g5_unit);
 
 	bool found = false;
 	for (int i = 0; i < current_state.texture_count; ++i) {
@@ -748,6 +790,7 @@ void kinc_g4_set_image_texture(kinc_g4_texture_unit_t unit, kinc_g4_texture_t *t
 	assert(KINC_G4_SHADER_TYPE_COUNT == KINC_G5_SHADER_TYPE_COUNT);
 	kinc_g5_texture_unit_t g5_unit;
 	memcpy(&g5_unit.stages[0], &unit.stages[0], KINC_G5_SHADER_TYPE_COUNT * sizeof(int));
+	g4_release_slot(&g5_unit);
 
 	bool found = false;
 	for (int i = 0; i < current_state.texture_count; ++i) {
@@ -834,6 +877,7 @@ void kinc_g4_render_target_use_color_as_texture(kinc_g4_render_target_t *render_
 	assert(KINC_G4_SHADER_TYPE_COUNT == KINC_G5_SHADER_TYPE_COUNT);
 	kinc_g5_texture_unit_t g5_unit;
 	memcpy(&g5_unit.stages[0], &unit.stages[0], KINC_G5_SHADER_TYPE_COUNT * sizeof(int));
+	g4_release_slot(&g5_unit);
 
 	bool found = false;
 	for (int i = 0; i < current_state.render_target_count; ++i) {
@@ -863,6 +907,7 @@ void kinc_g4_render_target_use_depth_as_texture(kinc_g4_render_target_t *render_
 	assert(KINC_G4_SHADER_TYPE_COUNT == KINC_G5_SHADER_TYPE_COUNT);
 	kinc_g5_texture_unit_t g5_unit;
 	memcpy(&g5_unit.stages[0], &unit.stages[0], KINC_G5_SHADER_TYPE_COUNT * sizeof(int));
+	g4_release_slot(&g5_unit);
 
 	bool found = false;
 	for (int i = 0; i < current_state.depth_render_target_count; ++i) {

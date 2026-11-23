@@ -1088,6 +1088,7 @@ void kinc_g5_internal_init() {
 			vkGetPhysicalDeviceFeatures(vk_ctx.gpu, &supported_features);
 			VkPhysicalDeviceFeatures enabled_features = {0};
 			enabled_features.independentBlend = supported_features.independentBlend;
+			enabled_features.geometryShader = supported_features.geometryShader;
 			enabled_features.fragmentStoresAndAtomics = supported_features.fragmentStoresAndAtomics;
 			enabled_features.vertexPipelineStoresAndAtomics = supported_features.vertexPipelineStoresAndAtomics;
 			enabled_features.shaderStorageImageWriteWithoutFormat = supported_features.shaderStorageImageWriteWithoutFormat;
