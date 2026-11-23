@@ -74,6 +74,12 @@ void kinc_g5_compute_shader_init(kinc_g5_compute_shader *shader, void *_data, in
 		_data = fixed;
 		length = (int)fixed_length;
 	}
+	size_t interface_length = 0;
+	uint32_t *interfaced = kinc_vulkan_fix_entry_interface((const uint32_t *)_data, (size_t)length, &interface_length);
+	if (interfaced != NULL) {
+		_data = interfaced;
+		length = (int)interface_length;
+	}
 	memset(shader->impl.locations, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
 	memset(shader->impl.offsets, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
 	memset(shader->impl.texture_bindings, 0, sizeof(kinc_internal_named_number) * KINC_INTERNAL_NAMED_NUMBER_COUNT);
@@ -189,6 +195,7 @@ void kinc_g5_compute_shader_init(kinc_g5_compute_shader *shader, void *_data, in
 	    return;
 	}*/
 	free(fixed);
+	free(interfaced);
 }
 
 void kinc_g5_compute_shader_destroy(kinc_g5_compute_shader *shader) {

@@ -16,6 +16,13 @@ void kinc_g5_shader_init(kinc_g5_shader_t *shader, const void *source, size_t le
 		shader->impl.source = (char *)fixed;
 		shader->impl.length = (int)fixed_length;
 	}
+	size_t interface_length = 0;
+	uint32_t *interfaced = kinc_vulkan_fix_entry_interface((const uint32_t *)shader->impl.source, (size_t)shader->impl.length, &interface_length);
+	if (interfaced != NULL) {
+		free(shader->impl.source);
+		shader->impl.source = (char *)interfaced;
+		shader->impl.length = (int)interface_length;
+	}
 	// Varying locations: outputs of vertex/geometry stages, inputs of fragment shaders (geometry inputs
 	// are per-vertex arrays, their outer dimension takes no extra locations)
 	uint32_t storage_class = type == KINC_G5_SHADER_TYPE_FRAGMENT ? 1 : (type == KINC_G5_SHADER_TYPE_VERTEX || type == KINC_G5_SHADER_TYPE_GEOMETRY ? 3 : 0);

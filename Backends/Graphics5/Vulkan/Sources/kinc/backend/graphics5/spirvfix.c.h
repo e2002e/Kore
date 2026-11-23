@@ -406,3 +406,98 @@ static uint32_t *kinc_vulkan_fix_interface_locations(const uint32_t *code, size_
 	}
 	return result;
 }
+
+// krafix sometimes leaves Input/Output variables an entry point uses out of its OpEntryPoint interface
+// (gl_FragCoord in Armory's refraction depth passes). GL compiles the GLSL and never noticed; Vulkan
+// drivers only wire up listed variables, the shader read NaN. Appends every global Input/Output variable
+// missing from the interface of each entry point. Returns a malloc'd copy or NULL when nothing changed.
+static uint32_t *kinc_vulkan_fix_entry_interface(const uint32_t *code, size_t length, size_t *out_length) {
+	size_t word_count = length / 4;
+	if (word_count < 5 || code[0] != 0x07230203) {
+		return NULL;
+	}
+	uint32_t vars[128];
+	int var_count = 0;
+	for (size_t i = 5; i < word_count;) {
+		uint32_t count = code[i] >> 16;
+		uint32_t op = code[i] & 0xffff;
+		if (count == 0 || i + count > word_count) {
+			return NULL;
+		}
+		if (op == 54 /* OpFunction */) {
+			break;
+		}
+		if (op == 59 /* OpVariable */ && (code[i + 3] == 1 /* Input */ || code[i + 3] == 3 /* Output */) && var_count < 128) {
+			vars[var_count++] = code[i + 2];
+		}
+		i += count;
+	}
+
+	// Count the missing ids over all entry points first
+	size_t extra = 0;
+	for (size_t i = 5; i < word_count;) {
+		uint32_t count = code[i] >> 16;
+		if ((code[i] & 0xffff) == 15 /* OpEntryPoint */) {
+			// Interface ids follow the nul-terminated, word-padded name at word 3
+			size_t name_words = strlen((const char *)&code[i + 3]) / 4 + 1;
+			size_t first = i + 3 + name_words;
+			for (int v = 0; v < var_count; ++v) {
+				bool listed = false;
+				for (size_t j = first; j < i + count; ++j) {
+					if (code[j] == vars[v]) {
+						listed = true;
+						break;
+					}
+				}
+				if (!listed) {
+					extra++;
+				}
+			}
+		}
+		i += count;
+	}
+	if (extra == 0) {
+		return NULL;
+	}
+
+	uint32_t *result = (uint32_t *)malloc((word_count + extra) * 4);
+	if (result == NULL) {
+		return NULL;
+	}
+	size_t w = 0;
+	for (size_t i = 0; i < 5; ++i) {
+		result[w++] = code[i];
+	}
+	for (size_t i = 5; i < word_count;) {
+		uint32_t count = code[i] >> 16;
+		if ((code[i] & 0xffff) == 15 /* OpEntryPoint */) {
+			size_t start = w;
+			for (size_t j = 0; j < count; ++j) {
+				result[w++] = code[i + j];
+			}
+			size_t name_words = strlen((const char *)&code[i + 3]) / 4 + 1;
+			size_t first = i + 3 + name_words;
+			for (int v = 0; v < var_count; ++v) {
+				bool listed = false;
+				for (size_t j = first; j < i + count; ++j) {
+					if (code[j] == vars[v]) {
+						listed = true;
+						break;
+					}
+				}
+				if (!listed) {
+					result[w++] = vars[v];
+				}
+			}
+			result[start] = ((uint32_t)(w - start) << 16) | 15;
+		}
+		else {
+			for (size_t j = 0; j < count; ++j) {
+				result[w++] = code[i + j];
+			}
+		}
+		i += count;
+	}
+	*out_length = w * 4;
+	return result;
+}
