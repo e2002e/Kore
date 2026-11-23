@@ -8,4 +8,7 @@ typedef struct kinc_g5_sampler_impl {
 	// declared sampler type (shadow or not), not slot state left behind by earlier draws.
 	VkSampler sampler_plain;
 	VkSampler sampler_compare;
+	// Linear min/mag variant: for 3D textures read by compute shaders that never set filters (GL keeps
+	// linear defaults on such textures, e.g. Armory's voxel volumes)
+	VkSampler sampler_linear;
 } kinc_g5_sampler_impl_t;

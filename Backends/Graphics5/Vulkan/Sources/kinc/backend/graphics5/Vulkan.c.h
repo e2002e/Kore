@@ -99,6 +99,7 @@ void kinc_vulkan_get_handles(VkInstance *instance, VkPhysicalDevice *physical_de
 // Per slot: the bound sampler's variants without / with depth comparison
 VkSampler vulkanSamplersPlain[16] = {VK_NULL_HANDLE};
 VkSampler vulkanSamplersCompare[16] = {VK_NULL_HANDLE};
+VkSampler vulkanSamplersLinear[16] = {VK_NULL_HANDLE};
 VkSampler vulkanSamplers[16] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
                                 VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
 

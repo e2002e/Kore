@@ -15,6 +15,7 @@ extern kinc_g5_texture_t *vulkanTextures[16];
 extern kinc_g5_render_target_t *vulkanRenderTargets[16];
 extern VkSampler vulkanSamplersPlain[16];
 extern VkSampler vulkanSamplersCompare[16];
+extern VkSampler vulkanSamplersLinear[16];
 extern bool vulkanRenderTargetsDepth[16];
 VkDescriptorSet getDescriptorSet(void);
 static VkDescriptorSet get_compute_descriptor_set(void);
@@ -899,7 +900,7 @@ void kinc_g5_command_list_set_fragment_constant_buffer(kinc_g5_command_list_t *l
 
 	VkDescriptorSet descriptor_set = kinc_vk_get_descriptor_set(
 	    currentPipeline->impl.set_layout, current_vertex_buffer, current_fragment_buffer, currentPipeline->impl.texture_kinds,
-	    currentPipeline->impl.texture_storage, currentPipeline->impl.texture_formats);
+	    currentPipeline->impl.texture_storage, currentPipeline->impl.texture_formats, false);
 	uint32_t offsets[2] = {lastVertexConstantBufferOffset, lastFragmentConstantBufferOffset};
 	vkCmdBindDescriptorSets(list->impl._buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, currentPipeline->impl.pipeline_layout, 0, 1, &descriptor_set, 2, offsets);
 }
@@ -910,7 +911,7 @@ void kinc_g5_command_list_set_compute_constant_buffer(kinc_g5_command_list_t *li
 	VkBuffer compute_buffer = buffer->impl.buf;
 	VkDescriptorSet descriptor_set =
 	    kinc_vk_get_descriptor_set(current_compute_shader->impl.set_layout, compute_buffer, compute_buffer, current_compute_shader->impl.texture_kinds,
-	                               current_compute_shader->impl.texture_storage, current_compute_shader->impl.texture_formats);
+	                               current_compute_shader->impl.texture_storage, current_compute_shader->impl.texture_formats, true);
 	uint32_t offsets[2] = {lastComputeConstantBufferOffset, lastComputeConstantBufferOffset};
 	vkCmdBindDescriptorSets(list->impl._buffer, VK_PIPELINE_BIND_POINT_COMPUTE, current_compute_shader->impl.pipeline_layout, 0, 1, &descriptor_set, 2,
 	                        offsets);
@@ -992,6 +993,7 @@ void kinc_g5_command_list_set_sampler(kinc_g5_command_list_t *list, kinc_g5_text
 		vulkanSamplers[slot] = sampler->impl.sampler;
 		vulkanSamplersPlain[slot] = sampler->impl.sampler_plain;
 		vulkanSamplersCompare[slot] = sampler->impl.sampler_compare;
+		vulkanSamplersLinear[slot] = sampler->impl.sampler_linear;
 	}
 }
 

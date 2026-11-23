@@ -177,7 +177,7 @@ static VkImageView kinc_vk_get_storage_dummy(int kind, VkFormat format) {
 }
 
 // The image infos of the 16 slots for the given shader bindings, from the currently bound textures
-static void kinc_vk_fill_image_infos(const uint8_t *kinds, const uint8_t *storage, const uint32_t *formats, VkDescriptorImageInfo *infos) {
+static void kinc_vk_fill_image_infos(const uint8_t *kinds, const uint8_t *storage, const uint32_t *formats, VkDescriptorImageInfo *infos, bool compute) {
 	memset(infos, 0, sizeof(VkDescriptorImageInfo) * 16);
 	for (int i = 0; i < 16; ++i) {
 		infos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -220,6 +220,11 @@ static void kinc_vk_fill_image_infos(const uint8_t *kinds, const uint8_t *storag
 		// mode as per-slot state, so it would otherwise leak onto later textures)
 		bool shadow = kinds[i] == KINC_VK_TEXTURE_KIND_2D_DEPTH || kinds[i] == KINC_VK_TEXTURE_KIND_CUBE_DEPTH;
 		infos[i].sampler = shadow ? vulkanSamplersCompare[i] : vulkanSamplersPlain[i];
+		// Volumes read by compute shaders filter linearly, like the GL defaults those shaders were written
+		// against (2D inputs stay as set: gbuffers hold packed data that must not be filtered)
+		if (compute && kinds[i] == KINC_VK_TEXTURE_KIND_3D && vulkanSamplersLinear[i] != VK_NULL_HANDLE) {
+			infos[i].sampler = vulkanSamplersLinear[i];
+		}
 		if (infos[i].sampler == VK_NULL_HANDLE) {
 			infos[i].sampler = get_dummy_texture(KINC_VK_TEXTURE_KIND_2D)->sampler;
 		}
@@ -270,7 +275,7 @@ static void kinc_vk_write_set(kinc_vk_set_entry *entry, const uint8_t *storage) 
 }
 
 static VkDescriptorSet kinc_vk_get_descriptor_set(VkDescriptorSetLayout layout, VkBuffer buffer0, VkBuffer buffer1, const uint8_t *kinds, const uint8_t *storage,
-                                                  const uint32_t *formats) {
+                                                  const uint32_t *formats, bool compute) {
 	kinc_vk_ensure_descriptor_pool();
 
 	kinc_vk_set_entry wanted;
@@ -278,7 +283,7 @@ static VkDescriptorSet kinc_vk_get_descriptor_set(VkDescriptorSetLayout layout, 
 	wanted.layout = layout;
 	wanted.buffers[0] = buffer0;
 	wanted.buffers[1] = buffer1;
-	kinc_vk_fill_image_infos(kinds, storage, formats, wanted.images);
+	kinc_vk_fill_image_infos(kinds, storage, formats, wanted.images, compute);
 
 	kinc_vk_set_entry *free_entry = NULL;
 	for (int i = 0; i < kinc_vk_set_count; ++i) {
