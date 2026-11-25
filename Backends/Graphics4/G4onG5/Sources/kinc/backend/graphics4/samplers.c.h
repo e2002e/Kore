@@ -10,6 +10,9 @@ static void samplers_reset(void) {
 	for (int i = 0; i < KINC_G5_SHADER_TYPE_COUNT; ++i) {
 		for (int j = 0; j < MAX_SAMPLERS_PER_STAGE; ++j) {
 			kinc_g5_sampler_options_set_defaults(&sampler_options[i][j]);
+			// G4 follows GL, whose default compare func is LEQUAL: callers that only enable compare mode
+			// (Iron's shadow maps) would otherwise get G5's ALWAYS and every shadow lookup reads "lit"
+			sampler_options[i][j].compare_mode = KINC_G5_COMPARE_MODE_LESS_EQUAL;
 		}
 	}
 }
