@@ -11,12 +11,12 @@
 #include <kinc/window.h>
 #include <vulkan/vulkan_core.h>
 
-extern kinc_g5_texture_t *vulkanTextures[16];
-extern kinc_g5_render_target_t *vulkanRenderTargets[16];
-extern VkSampler vulkanSamplersPlain[16];
-extern VkSampler vulkanSamplersCompare[16];
-extern VkSampler vulkanSamplersLinear[16];
-extern bool vulkanRenderTargetsDepth[16];
+extern kinc_g5_texture_t *vulkanTextures[KINC_VK_TEXTURE_SLOTS];
+extern kinc_g5_render_target_t *vulkanRenderTargets[KINC_VK_TEXTURE_SLOTS];
+extern VkSampler vulkanSamplersPlain[KINC_VK_TEXTURE_SLOTS];
+extern VkSampler vulkanSamplersCompare[KINC_VK_TEXTURE_SLOTS];
+extern VkSampler vulkanSamplersLinear[KINC_VK_TEXTURE_SLOTS];
+extern bool vulkanRenderTargetsDepth[KINC_VK_TEXTURE_SLOTS];
 VkDescriptorSet getDescriptorSet(void);
 static VkDescriptorSet get_compute_descriptor_set(void);
 bool memory_type_from_properties(uint32_t typeBits, VkFlags requirements_mask, uint32_t *typeIndex);
@@ -113,7 +113,7 @@ static void endPass(kinc_g5_command_list_t *list) {
 		in_render_pass = false;
 	}
 
-	for (int i = 0; i < 16; ++i) {
+	for (int i = 0; i < KINC_VK_TEXTURE_SLOTS; ++i) {
 		vulkanTextures[i] = NULL;
 		vulkanRenderTargets[i] = NULL;
 		vulkanRenderTargetsDepth[i] = false;
@@ -978,7 +978,8 @@ void kinc_g5_command_list_set_fragment_constant_buffer(kinc_g5_command_list_t *l
 
 	VkDescriptorSet descriptor_set = kinc_vk_get_descriptor_set(
 	    currentPipeline->impl.set_layout, current_vertex_buffer, current_fragment_buffer, currentPipeline->impl.texture_kinds,
-	    currentPipeline->impl.texture_storage, currentPipeline->impl.texture_formats, false);
+	    currentPipeline->impl.texture_storage, currentPipeline->impl.texture_formats, currentPipeline->impl.texture_counts,
+	    currentPipeline->impl.texture_first_extra, false);
 	uint32_t offsets[2] = {lastVertexConstantBufferOffset, lastFragmentConstantBufferOffset};
 	vkCmdBindDescriptorSets(list->impl._buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, currentPipeline->impl.pipeline_layout, 0, 1, &descriptor_set, 2, offsets);
 }
@@ -989,7 +990,8 @@ void kinc_g5_command_list_set_compute_constant_buffer(kinc_g5_command_list_t *li
 	VkBuffer compute_buffer = buffer->impl.buf;
 	VkDescriptorSet descriptor_set =
 	    kinc_vk_get_descriptor_set(current_compute_shader->impl.set_layout, compute_buffer, compute_buffer, current_compute_shader->impl.texture_kinds,
-	                               current_compute_shader->impl.texture_storage, current_compute_shader->impl.texture_formats, true);
+	                               current_compute_shader->impl.texture_storage, current_compute_shader->impl.texture_formats,
+	                               current_compute_shader->impl.texture_counts, current_compute_shader->impl.texture_first_extra, true);
 	uint32_t offsets[2] = {lastComputeConstantBufferOffset, lastComputeConstantBufferOffset};
 	vkCmdBindDescriptorSets(list->impl._buffer, VK_PIPELINE_BIND_POINT_COMPUTE, current_compute_shader->impl.pipeline_layout, 0, 1, &descriptor_set, 2,
 	                        offsets);
@@ -1048,7 +1050,7 @@ static int unit_slot(kinc_g5_texture_unit_t unit) {
 	static const int order[] = {KINC_G5_SHADER_TYPE_FRAGMENT, KINC_G5_SHADER_TYPE_COMPUTE, KINC_G5_SHADER_TYPE_VERTEX, KINC_G5_SHADER_TYPE_GEOMETRY};
 	for (int i = 0; i < 4; ++i) {
 		int slot = unit.stages[order[i]];
-		if (slot >= 0 && slot < 16) {
+		if (slot >= 0 && slot < KINC_VK_TEXTURE_SLOTS) {
 			return slot;
 		}
 	}

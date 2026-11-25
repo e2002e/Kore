@@ -36,10 +36,10 @@ void set_image_layout(VkImage image, VkImageAspectFlags aspectMask, VkImageLayou
 
 // uint32_t current_buffer;
 
-kinc_g5_texture_t *vulkanTextures[16] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
-kinc_g5_render_target_t *vulkanRenderTargets[16] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+kinc_g5_texture_t *vulkanTextures[KINC_VK_TEXTURE_SLOTS] = {NULL};
+kinc_g5_render_target_t *vulkanRenderTargets[KINC_VK_TEXTURE_SLOTS] = {NULL};
 // Per slot: sample the render target's depth instead of its color
-bool vulkanRenderTargetsDepth[16] = {false};
+bool vulkanRenderTargetsDepth[KINC_VK_TEXTURE_SLOTS] = {false};
 
 // Interop for code outside Kore that talks to Vulkan directly (e.g. NVIDIA NGX/DLSS in armorcore).
 #define KINC_VK_MAX_EXTERNAL_EXTENSIONS 32
@@ -97,11 +97,10 @@ void kinc_vulkan_get_handles(VkInstance *instance, VkPhysicalDevice *physical_de
 	*queue = vk_ctx.queue;
 }
 // Per slot: the bound sampler's variants without / with depth comparison
-VkSampler vulkanSamplersPlain[16] = {VK_NULL_HANDLE};
-VkSampler vulkanSamplersCompare[16] = {VK_NULL_HANDLE};
-VkSampler vulkanSamplersLinear[16] = {VK_NULL_HANDLE};
-VkSampler vulkanSamplers[16] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
-                                VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+VkSampler vulkanSamplersPlain[KINC_VK_TEXTURE_SLOTS] = {VK_NULL_HANDLE};
+VkSampler vulkanSamplersCompare[KINC_VK_TEXTURE_SLOTS] = {VK_NULL_HANDLE};
+VkSampler vulkanSamplersLinear[KINC_VK_TEXTURE_SLOTS] = {VK_NULL_HANDLE};
+VkSampler vulkanSamplers[KINC_VK_TEXTURE_SLOTS] = {VK_NULL_HANDLE};
 
 static bool began = false;
 

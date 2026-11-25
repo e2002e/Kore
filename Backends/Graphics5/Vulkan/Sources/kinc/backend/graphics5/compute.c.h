@@ -10,7 +10,8 @@ static void parse_shader(uint32_t *shader_source, int shader_length, kinc_intern
 static VkShaderModule create_shader_module(const void *code, size_t size);
 static bool has_number(kinc_internal_named_number *named_numbers, const char *name);
 static uint32_t find_number(kinc_internal_named_number *named_numbers, const char *name);
-static void record_bindings(uint8_t *kinds, uint8_t *storage, uint32_t *formats);
+static void record_bindings(uint8_t *kinds, uint8_t *storage, uint32_t *formats, uint8_t *counts);
+static void assign_array_slots(uint8_t *kinds, uint8_t *storage, uint32_t *formats, uint8_t *counts, uint8_t *first_extra);
 
 static VkDescriptorPool compute_descriptor_pool;
 
@@ -87,8 +88,11 @@ void kinc_g5_compute_shader_init(kinc_g5_compute_shader *shader, void *_data, in
 	memset(shader->impl.texture_kinds, 0, sizeof(shader->impl.texture_kinds));
 	memset(shader->impl.texture_storage, 0, sizeof(shader->impl.texture_storage));
 	memset(shader->impl.texture_formats, 0, sizeof(shader->impl.texture_formats));
-	record_bindings(shader->impl.texture_kinds, shader->impl.texture_storage, shader->impl.texture_formats);
-	shader->impl.set_layout = kinc_vk_get_set_layout(shader->impl.texture_storage, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_STAGE_COMPUTE_BIT,
+	memset(shader->impl.texture_counts, 0, sizeof(shader->impl.texture_counts));
+	record_bindings(shader->impl.texture_kinds, shader->impl.texture_storage, shader->impl.texture_formats, shader->impl.texture_counts);
+	assign_array_slots(shader->impl.texture_kinds, shader->impl.texture_storage, shader->impl.texture_formats, shader->impl.texture_counts,
+	                   shader->impl.texture_first_extra);
+	shader->impl.set_layout = kinc_vk_get_set_layout(shader->impl.texture_storage, shader->impl.texture_counts, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_STAGE_COMPUTE_BIT,
 	                                                 VK_SHADER_STAGE_COMPUTE_BIT);
 
 	VkPipelineLayoutCreateInfo pPipelineLayoutCreateInfo = {0};
@@ -226,7 +230,7 @@ kinc_g5_texture_unit_t kinc_g5_compute_shader_get_texture_unit(kinc_g5_compute_s
 	for (int i = 0; i < KINC_G5_SHADER_TYPE_COUNT; ++i) {
 		unit.stages[i] = -1;
 	}
-	// Sampler arrays ("name[0]") are one binding named without the index (element 0 only)
+	// Sampler arrays ("name[2]") are one binding named without the index (see assign_array_slots)
 	char base_name[64];
 	const char *bracket = strchr(name, '[');
 	int array_index = 0;
@@ -236,10 +240,17 @@ kinc_g5_texture_unit_t kinc_g5_compute_shader_get_texture_unit(kinc_g5_compute_s
 		array_index = atoi(bracket + 1);
 		name = base_name;
 	}
-	if (array_index == 0 && has_number(shader->impl.texture_bindings, name)) {
+	if (has_number(shader->impl.texture_bindings, name)) {
 		int binding = (int)find_number(shader->impl.texture_bindings, name);
 		if (binding >= 2 && binding < 18) {
-			unit.stages[KINC_G5_SHADER_TYPE_COMPUTE] = binding - 2;
+			int slot = binding - 2;
+			if (array_index == 0) {
+				unit.stages[KINC_G5_SHADER_TYPE_COMPUTE] = slot;
+			}
+			else if (array_index < shader->impl.texture_counts[slot] && shader->impl.texture_first_extra[slot] != 0 &&
+			         shader->impl.texture_first_extra[slot] + array_index - 1 < KINC_VK_TEXTURE_SLOTS) {
+				unit.stages[KINC_G5_SHADER_TYPE_COMPUTE] = shader->impl.texture_first_extra[slot] + array_index - 1;
+			}
 		}
 	}
 	return unit;

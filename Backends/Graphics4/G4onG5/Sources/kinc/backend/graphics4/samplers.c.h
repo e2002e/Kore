@@ -2,7 +2,7 @@
 
 #include <assert.h>
 
-#define MAX_SAMPLERS_PER_STAGE 16
+#define MAX_SAMPLERS_PER_STAGE 32
 
 static kinc_g5_sampler_options_t sampler_options[KINC_G5_SHADER_TYPE_COUNT][MAX_SAMPLERS_PER_STAGE];
 

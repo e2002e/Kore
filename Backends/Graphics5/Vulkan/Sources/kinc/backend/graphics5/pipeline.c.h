@@ -7,11 +7,11 @@
 #include <assert.h>
 
 VkDescriptorSetLayout desc_layout;
-extern kinc_g5_texture_t *vulkanTextures[16];
-extern kinc_g5_render_target_t *vulkanRenderTargets[16];
-extern VkSampler vulkanSamplersPlain[16];
-extern VkSampler vulkanSamplersCompare[16];
-extern bool vulkanRenderTargetsDepth[16];
+extern kinc_g5_texture_t *vulkanTextures[KINC_VK_TEXTURE_SLOTS];
+extern kinc_g5_render_target_t *vulkanRenderTargets[KINC_VK_TEXTURE_SLOTS];
+extern VkSampler vulkanSamplersPlain[KINC_VK_TEXTURE_SLOTS];
+extern VkSampler vulkanSamplersCompare[KINC_VK_TEXTURE_SLOTS];
+extern bool vulkanRenderTargetsDepth[KINC_VK_TEXTURE_SLOTS];
 extern uint32_t swapchainImageCount;
 extern uint32_t current_buffer;
 bool memory_type_from_properties(uint32_t typeBits, VkFlags requirements_mask, uint32_t *typeIndex);
@@ -134,6 +134,7 @@ typedef struct {
 	uint8_t kind;
 	uint8_t storage;   // image load/store (OpTypeImage Sampled = 2), not a sampled texture
 	uint32_t format;   // SPIR-V ImageFormat of storage images
+	uint32_t count;    // array length of sampler arrays, 1 otherwise
 } parsed_texture_kind;
 static parsed_texture_kind parsed_texture_kinds[32];
 static int parsed_texture_kinds_count = 0;
@@ -142,6 +143,21 @@ typedef struct {
 	uint16_t op;
 	uint32_t a, b, c, d, e;
 } spv_id_info;
+
+// Length of a sampler array variable (OpVariable -> OpTypePointer -> OpTypeArray -> OpConstant), 1 otherwise
+static uint32_t resolve_array_length(spv_id_info *ids, uint32_t bound, uint32_t variable) {
+	if (variable >= bound || ids[variable].op != 59) {
+		return 1;
+	}
+	uint32_t t = ids[variable].a;
+	if (t < bound && ids[t].op == 32) {
+		t = ids[t].a;
+	}
+	if (t < bound && ids[t].op == 28 && ids[t].b < bound && ids[ids[t].b].op == 43 && ids[ids[t].b].a > 1) {
+		return ids[ids[t].b].a;
+	}
+	return 1;
+}
 
 static uint8_t resolve_texture_kind(spv_id_info *ids, uint32_t bound, uint32_t variable, uint8_t *storage, uint32_t *format) {
 	*storage = 0;
@@ -242,6 +258,13 @@ static void parse_shader(uint32_t *shader_source, int shader_length, kinc_intern
 			if (operands[0] < bound && ids != NULL) {
 				ids[operands[0]].op = (uint16_t)opcode;
 				ids[operands[0]].a = operands[1];
+				ids[operands[0]].b = opcode == 28 ? operands[2] : 0;
+			}
+			break;
+		case 43: // OpConstant: result type, result, value
+			if (operands[1] < bound && ids != NULL && ids[operands[1]].op == 0) {
+				ids[operands[1]].op = 43;
+				ids[operands[1]].a = operands[2];
 			}
 			break;
 		case 32: // OpTypePointer: result, storage class, type
@@ -303,6 +326,7 @@ static void parse_shader(uint32_t *shader_source, int shader_length, kinc_intern
 			parsed_texture_kinds[parsed_texture_kinds_count].binding = bindings[i].value;
 			parsed_texture_kinds[parsed_texture_kinds_count].kind = resolve_texture_kind(ids, bound, bindings[i].id, &parsed_texture_kinds[parsed_texture_kinds_count].storage,
 			                                                                             &parsed_texture_kinds[parsed_texture_kinds_count].format);
+			parsed_texture_kinds[parsed_texture_kinds_count].count = resolve_array_length(ids, bound, bindings[i].id);
 			parsed_texture_kinds_count++;
 		}
 	}
@@ -410,8 +434,8 @@ kinc_g5_constant_location_t kinc_g5_pipeline_get_constant_location(kinc_g5_pipel
 
 kinc_g5_texture_unit_t kinc_g5_pipeline_get_texture_unit(kinc_g5_pipeline_t *pipeline, const char *name) {
 	kinc_g5_texture_unit_t unit;
-	// Sampler arrays ("shadowMap[0]") are one binding named without the index. The descriptor layout
-	// has one descriptor per binding, so only element 0 can be bound for now.
+	// Sampler arrays ("shadowMap[2]") are one binding named without the index: element 0 uses the
+	// binding's slot, the others the slots assign_array_slots gave them.
 	char base_name[64];
 	const char *bracket = strchr(name, '[');
 	int array_index = 0;
@@ -421,15 +445,24 @@ kinc_g5_texture_unit_t kinc_g5_pipeline_get_texture_unit(kinc_g5_pipeline_t *pip
 		array_index = atoi(bracket + 1);
 		name = base_name;
 	}
-	int number = array_index == 0 ? (int)find_number(pipeline->impl.textureBindings, name) : -1;
+	int number = has_number(pipeline->impl.textureBindings, name) ? (int)find_number(pipeline->impl.textureBindings, name) : -1;
 	assert(number == -1 || number >= 2); // something wrong with the SPIR-V when this triggers
 
 	for (int i = 0; i < KINC_G5_SHADER_TYPE_COUNT; ++i) {
 		unit.stages[i] = -1;
 	}
 
-	if (number >= 0) {
-		unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT] = number - 2;
+	if (number >= 2 && number < 18) {
+		int slot = number - 2;
+		if (array_index == 0) {
+			unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT] = slot;
+		}
+		else if (array_index < pipeline->impl.texture_counts[slot] && pipeline->impl.texture_first_extra[slot] != 0) {
+			int extra = pipeline->impl.texture_first_extra[slot] + array_index - 1;
+			if (extra < KINC_VK_TEXTURE_SLOTS) {
+				unit.stages[KINC_G5_SHADER_TYPE_FRAGMENT] = extra;
+			}
+		}
 	}
 
 	return unit;
@@ -600,19 +633,50 @@ static VkFormat convert_vertex_format(kinc_g4_vertex_data_t data) {
 }
 
 // Copies what the last parse_shader call found about sampler/image bindings 2..17 into per-slot arrays
-static void record_bindings(uint8_t *kinds, uint8_t *storage, uint32_t *formats) {
+static void record_bindings(uint8_t *kinds, uint8_t *storage, uint32_t *formats, uint8_t *counts) {
 	for (int i = 0; i < parsed_texture_kinds_count; ++i) {
 		uint32_t binding = parsed_texture_kinds[i].binding;
 		if (binding >= 2 && binding < 18 && parsed_texture_kinds[i].kind != KINC_VK_TEXTURE_KIND_UNKNOWN) {
 			kinds[binding - 2] = parsed_texture_kinds[i].kind;
 			storage[binding - 2] = parsed_texture_kinds[i].storage;
 			formats[binding - 2] = parsed_texture_kinds[i].format;
+			uint32_t count = parsed_texture_kinds[i].count;
+			if (count > counts[binding - 2]) {
+				counts[binding - 2] = (uint8_t)(count > 255 ? 255 : count);
+			}
+		}
+	}
+}
+
+// Sampler arrays: element [0] stays in the binding's own slot, elements [1..n-1] get consecutive slots
+// from 16 up (the descriptor write gathers them back into one array binding). Arrays that do not fit
+// are shortened, their missing elements read the dummy of the declared type.
+static void assign_array_slots(uint8_t *kinds, uint8_t *storage, uint32_t *formats, uint8_t *counts, uint8_t *first_extra) {
+	int next = 16;
+	for (int s = 0; s < 16; ++s) {
+		if (counts[s] == 0) {
+			counts[s] = 1;
+		}
+		first_extra[s] = 0;
+		if (counts[s] > 1) {
+			int extra = counts[s] - 1;
+			if (next + extra > KINC_VK_TEXTURE_SLOTS) {
+				kinc_log(KINC_LOG_LEVEL_WARNING, "Vulkan: sampler array at binding %d does not fit the texture slots", s + 2);
+				extra = KINC_VK_TEXTURE_SLOTS - next;
+			}
+			first_extra[s] = (uint8_t)next;
+			for (int e = 0; e < extra; ++e) {
+				kinds[next + e] = kinds[s];
+				storage[next + e] = storage[s];
+				formats[next + e] = formats[s];
+			}
+			next += extra;
 		}
 	}
 }
 
 static void record_texture_kinds(kinc_g5_pipeline_t *pipeline) {
-	record_bindings(pipeline->impl.texture_kinds, pipeline->impl.texture_storage, pipeline->impl.texture_formats);
+	record_bindings(pipeline->impl.texture_kinds, pipeline->impl.texture_storage, pipeline->impl.texture_formats, pipeline->impl.texture_counts);
 }
 
 void kinc_g5_pipeline_compile(kinc_g5_pipeline_t *pipeline) {
@@ -624,6 +688,8 @@ void kinc_g5_pipeline_compile(kinc_g5_pipeline_t *pipeline) {
 	memset(pipeline->impl.texture_kinds, 0, sizeof(pipeline->impl.texture_kinds));
 	memset(pipeline->impl.texture_storage, 0, sizeof(pipeline->impl.texture_storage));
 	memset(pipeline->impl.texture_formats, 0, sizeof(pipeline->impl.texture_formats));
+	memset(pipeline->impl.texture_counts, 0, sizeof(pipeline->impl.texture_counts));
+	memset(pipeline->impl.texture_first_extra, 0, sizeof(pipeline->impl.texture_first_extra));
 	parse_shader((uint32_t *)pipeline->vertexShader->impl.source, pipeline->vertexShader->impl.length, pipeline->impl.vertexLocations,
 	             pipeline->impl.textureBindings, pipeline->impl.vertexOffsets);
 	record_texture_kinds(pipeline);
@@ -656,8 +722,11 @@ void kinc_g5_pipeline_compile(kinc_g5_pipeline_t *pipeline) {
 		}
 	}
 
+	assign_array_slots(pipeline->impl.texture_kinds, pipeline->impl.texture_storage, pipeline->impl.texture_formats, pipeline->impl.texture_counts,
+	                   pipeline->impl.texture_first_extra);
+
 	VkShaderStageFlags geometry_stage = has_geometry ? VK_SHADER_STAGE_GEOMETRY_BIT : 0;
-	pipeline->impl.set_layout = kinc_vk_get_set_layout(pipeline->impl.texture_storage, VK_SHADER_STAGE_VERTEX_BIT,
+	pipeline->impl.set_layout = kinc_vk_get_set_layout(pipeline->impl.texture_storage, pipeline->impl.texture_counts, VK_SHADER_STAGE_VERTEX_BIT,
 	                                                   VK_SHADER_STAGE_FRAGMENT_BIT | geometry_stage,
 	                                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | geometry_stage);
 
